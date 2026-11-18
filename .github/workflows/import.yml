@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Darthelfer Matchimport
+      - name: Darthelfer Einzelspielimport
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -28,15 +28,16 @@ jobs:
           import time
           import urllib.request
           import urllib.error
-
           from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
 
           BASE = "https://www.darthelfer.de/api/public"
 
-          EVENT_ID = "cb3ed76e-935b-4f38-835c-f91eab283776"
+          EVENT_IDS = [
+              "095a9171-9b93-491d-9fb0-f8c4c41509d7"
+          ]
 
-          SUPABASE_URL = (
+          URL = (
               os.environ["SUPABASE_URL"]
               .strip()
               .rstrip("/")
@@ -44,9 +45,6 @@ jobs:
           )
 
           KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip()
-
-          if not SUPABASE_URL or not KEY:
-              raise RuntimeError("Supabase-Zugangsdaten fehlen")
 
           HEADERS = {
               "apikey": KEY,
@@ -69,326 +67,514 @@ jobs:
               return dt.isoformat()
 
           def request_json(url, data=None, headers=None, method="GET"):
-              request = urllib.request.Request(
+              req = urllib.request.Request(
                   url,
                   data=None if data is None else json.dumps(data).encode(),
                   headers=headers or {"Accept": "application/json"},
                   method=method
               )
-
-              with urllib.request.urlopen(request, timeout=40) as response:
-                  body = response.read()
-                  return json.loads(body) if body else None
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          body = response.read()
+                          return json.loads(body) if body else None
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (429, 500, 502, 503, 504):
+                          raise
+                      if attempt == 2:
+                          raise
+                      time.sleep(3 * (attempt + 1))
 
           def upsert(table, data, conflict):
-              url = (
-                  SUPABASE_URL + "/rest/v1/" + table
-                  + "?on_conflict=" + conflict
-              )
               try:
-                  return request_json(url, data, HEADERS, "POST")
+                  return request_json(
+                      URL + "/rest/v1/" + table
+                      + "?on_conflict=" + conflict,
+                      data, HEADERS, "POST"
+                  )
               except urllib.error.HTTPError as error:
                   print(f"Datenbankfehler: {table}, HTTP {error.code}")
                   raise RuntimeError(
                       f"Speicherung in {table} fehlgeschlagen"
                   ) from None
 
-          print("DART LIONS PLAYER CENTER")
-          print("Starte Matchimport")
-
-          tournament = request_json(
-              BASE + "/tournament/" + EVENT_ID
-          )
-
-          group = tournament["turnierGruppe"]
-
-          event = upsert(
-              "pc_events",
-              {
-                  "darthelfer_event_id": EVENT_ID,
-                  "event_name": group["bezeichnung"],
-                  "event_type": "competition",
-                  "event_date": datetime.strptime(
-                      group["beginnString"], "%d.%m.%Y"
-                  ).date().isoformat(),
-                  "is_finished": True,
-                  "synced_at": now()
-              },
-              "darthelfer_event_id"
-          )[0]
-
-          event_db_id = event["id"]
-
-          games = tournament.get("tournamentGames") or []
-
-          print(f"Archiv-Matchreferenzen: {len(games)}")
+          def patch(table, row_id, data):
+              return request_json(
+                  URL + "/rest/v1/" + table + "?id=eq." + row_id,
+                  data, HEADERS, "PATCH"
+              )
 
           totals = {
+              "events": 0,
               "matches": 0,
               "players": 0,
               "legs": 0,
               "throws": 0,
-              "missing": 0
+              "doubles": 0,
+              "missing": 0,
+              "unclear": 0
           }
 
-          seen = set()
+          def import_event(event_id):
 
-          for reference in games:
-
-              game_id = reference.get("gameId")
-              match_id = reference.get("tournamentGameId")
-              source_id = reference.get("tournamentId")
-
-              if not match_id or not source_id:
-                  continue
-
-              identity = game_id or (source_id, match_id)
-
-              if identity in seen:
-                  continue
-
-              seen.add(identity)
-
-              archive_url = (
-                  BASE + "/gameausarchiv/x01/"
-                  + source_id + "/"
-                  + match_id + "/tournamentgameid"
+              tournament = request_json(
+                  BASE + "/tournament/" + event_id
               )
 
-              try:
-                  archive = request_json(archive_url)
+              main = (
+                  tournament.get("turnierMain")
+                  or tournament.get("turnierGruppe")
+                  or {}
+              )
 
-              except urllib.error.HTTPError as error:
-                  if error.code == 404:
-                      totals["missing"] += 1
-                      print("Archiv nicht verfügbar")
-                      continue
-                  raise
+              group = tournament.get("turnierGruppe") or main
 
-              if not archive or not archive.get("gameid"):
-                  totals["missing"] += 1
-                  continue
+              if not main:
+                  raise RuntimeError("Turnierstruktur nicht erkannt")
 
-              scores = {
-                  item["gamedetailId"]: item.get("scores", [])
-                  for item in archive.get("scores", [])
-              }
+              if main.get("doppelturnier") or group.get("doppelturnier"):
+                  print("Doppelturnier ausgeschlossen")
+                  return
 
-              match = upsert(
-                  "pc_matches",
+              name = group.get("bezeichnung") or main.get("bezeichnung")
+
+              if not name:
+                  raise RuntimeError("Veranstaltungsname fehlt")
+
+              league = main.get("turniersystem") == "LIGASPIELTAG"
+
+              if "test" in name.lower():
+                  print("Testveranstaltung ausgeschlossen")
+                  return
+
+              if league:
+                  event_type = "league"
+              elif "competition" in name.lower():
+                  event_type = "competition"
+              elif "training" in name.lower():
+                  event_type = "training"
+              else:
+                  event_type = "tournament"
+
+              finished = (
+                  main.get("tournamentstatus") == "abgeschlossen"
+                  or group.get("tournamentstatus") == "abgeschlossen"
+              )
+
+              if not finished:
+                  print("Nicht abgeschlossene Veranstaltung übersprungen")
+                  return
+
+              player_lookup = {}
+
+              for key in (
+                  "turnierMain",
+                  "turnierGruppe",
+                  "turnierKO",
+                  "turnierBronze",
+                  "turnierSilber"
+              ):
+                  part = tournament.get(key) or {}
+
+                  for field in (
+                      "tournamentPlayerEntities",
+                      "playersSortedByTime",
+                      "ranglistePlayerEntities"
+                  ):
+                      for p in part.get(field) or []:
+                          if p.get("id"):
+                              player_lookup[p["id"]] = p
+
+              if league:
+                  games = main.get("tournamentLeagueGameEntities") or []
+              else:
+                  games = tournament.get("tournamentGames") or []
+
+              print("------------------------------")
+              print(name)
+              print(f"Matchreferenzen: {len(games)}")
+
+              date_string = (
+                  group.get("beginnString")
+                  or main.get("beginnString")
+              )
+
+              event = upsert(
+                  "pc_events",
                   {
-                      "event_id": event_db_id,
-                      "darthelfer_match_id": match_id,
-                      "darthelfer_game_id": archive["gameid"],
-                      "source_tournament_id": source_id,
-                      "match_type": "singles",
-                      "played_at": timestamp(
-                          archive.get("startzeitpunkt")
-                      ),
-                      "started_at": timestamp(
-                          archive.get("startzeitpunkt")
-                      ),
-                      "finished_at": timestamp(
-                          archive.get("endezeitpunkt")
-                      ),
-                      "duration_minutes": archive.get("dauer"),
-                      "is_finished": bool(
-                          archive.get("endezeitpunkt")
-                      ),
-                      "archive_available": True,
-                      "raw_data": archive,
+                      "darthelfer_event_id": event_id,
+                      "event_name": name,
+                      "event_type": event_type,
+                      "event_date": datetime.strptime(
+                          date_string, "%d.%m.%Y"
+                      ).date().isoformat(),
+                      "is_finished": True,
+                      "home_team": main.get("mannschaftHeim"),
+                      "away_team": main.get("mannschaftGast"),
                       "synced_at": now()
                   },
-                  "event_id,darthelfer_match_id"
+                  "darthelfer_event_id"
               )[0]
 
-              totals["matches"] += 1
+              totals["events"] += 1
+              seen = set()
 
-              for side in (1, 2):
+              for ref in games:
 
-                  stat = archive.get(
-                      f"player{side}Statistik"
-                  ) or {}
-
-                  details = archive.get(
-                      f"gameDetailsPlayer{side}"
-                  ) or []
-
-                  player_id = archive.get(f"player{side}Id")
-
-                  if not player_id:
+                  if league and ref.get("type") != "EZ":
+                      if ref.get("type") == "DP":
+                          totals["doubles"] += 1
+                      else:
+                          totals["unclear"] += 1
                       continue
 
-                  attempts = stat.get("anzahlDoppelwuerfe")
+                  if ref.get("type") == "DP":
+                      totals["doubles"] += 1
+                      continue
 
-                  double_known = (
-                      attempts is not None and attempts > 0
+                  if any(
+                      value for key, value in ref.items()
+                      if key.lower().startswith("doppelpartner")
+                  ):
+                      totals["doubles"] += 1
+                      continue
+
+                  ref_players = [
+                      player_lookup.get(ref.get("player1Id"), {}),
+                      player_lookup.get(ref.get("player2Id"), {})
+                  ]
+
+                  if any(p.get("doppelspieler") for p in ref_players):
+                      totals["doubles"] += 1
+                      continue
+
+                  game_id = ref.get("gameId")
+
+                  match_id = (
+                      ref.get("tournamentGameId")
+                      or ref.get("id")
                   )
 
-                  winning_legs = [
-                      leg for leg in details
-                      if leg.get("gewonnen") is True
-                      and leg.get("abgeschlossen") is True
-                  ]
+                  source_id = ref.get("tournamentId") or event_id
 
-                  leg_lengths = [
-                      leg["wuerfe"] for leg in winning_legs
-                      if leg.get("wuerfe")
-                  ]
+                  if not match_id:
+                      totals["unclear"] += 1
+                      continue
 
-                  finishes = []
+                  identity = game_id or (source_id, match_id)
 
-                  for leg in winning_legs:
-                      for score in scores.get(leg["id"], []):
-                          if (
-                              score.get("scoregueltig") is True
-                              and score.get("togo") == 0
-                              and score.get("aufnahme") is not None
-                          ):
-                              finishes.append(score["aufnahme"])
+                  if identity in seen:
+                      continue
 
-                  highs = stat.get("highscores")
+                  seen.add(identity)
 
-                  player = upsert(
-                      "pc_match_players",
-                      {
-                          "match_id": match["id"],
-                          "darthelfer_player_id": player_id,
-                          "darthelfer_user_id": stat.get("userid"),
-                          "player_name": archive.get(f"player{side}Name"),
-                          "player_side": side,
-                          "won": (
-                              archive.get("gewonnenPlayerid") == player_id
-                              if archive.get("gewonnenPlayerid")
-                              else None
-                          ),
-                          "legs_won": stat.get("gewonneneLegs"),
-                          "legs_lost": stat.get("verloreneLegs"),
-                          "scored_points": stat.get("anzahlGeworfenerPunkteGesamt"),
-                          "darts_thrown": stat.get("anzahlWuerfeGesamt"),
-                          "average": stat.get("average"),
-                          "first9_average": stat.get("first9Average"),
-                          "first12_average": stat.get("first12Average"),
-                          "first15_average": stat.get("first15Average"),
-                          "first9_points": stat.get("anzahlGeworfenerPunkteFirst9"),
-                          "first9_darts": stat.get("anzahlWuerfeFirst9"),
-                          "first12_points": stat.get("anzahlGeworfenerPunkteFirst12"),
-                          "first12_darts": stat.get("anzahlWuerfeFirst12"),
-                          "first15_points": stat.get("anzahlGeworfenerPunkteFirst15"),
-                          "first15_darts": stat.get("anzahlWuerfeFirst15"),
-                          "count_100": (
-                              sum(100 <= n < 140 for n in highs)
-                              if highs is not None else None
-                          ),
-                          "count_140": (
-                              sum(140 <= n < 180 for n in highs)
-                              if highs is not None else None
-                          ),
-                          "count_180": stat.get("_180er"),
-                          "highest_finish": max(finishes, default=None),
-                          "shortest_leg": min(leg_lengths, default=None),
-                          "longest_leg": max(leg_lengths, default=None),
-                          "double_attempts": attempts if double_known else None,
-                          "double_hits": stat.get("anzahlDoppelgetroffen") if double_known else None,
-                          "double_percentage": stat.get("doppelquote") if double_known else None,
-                          "raw_data": stat
-                      },
-                      "match_id,darthelfer_player_id"
-                  )[0]
+                  try:
+                      archive = request_json(
+                          BASE + "/gameausarchiv/x01/"
+                          + source_id + "/" + match_id
+                          + "/tournamentgameid"
+                      )
+                  except urllib.error.HTTPError as error:
+                      if error.code == 404:
+                          totals["missing"] += 1
+                          continue
+                      raise
 
-                  totals["players"] += 1
+                  if not archive or not archive.get("gameid"):
+                      totals["missing"] += 1
+                      continue
 
-                  for detail in details:
+                  if not archive.get("endezeitpunkt"):
+                      totals["unclear"] += 1
+                      continue
 
-                      visits = scores.get(detail["id"], [])
+                  sides = []
 
-                      checkout = next(
-                          (
-                              s["aufnahme"]
-                              for s in visits
-                              if s.get("scoregueltig") is True
-                              and s.get("togo") == 0
-                              and s.get("aufnahme") is not None
-                              and detail.get("gewonnen") is True
-                          ),
-                          None
+                  for side in (1, 2):
+                      player_id = archive.get(f"player{side}Id")
+                      stat = archive.get(f"player{side}Statistik") or {}
+                      details = archive.get(f"gameDetailsPlayer{side}") or []
+                      info = player_lookup.get(player_id, {})
+
+                      sides.append(
+                          (side, player_id, stat, details, info)
                       )
 
-                      leg = upsert(
-                          "pc_legs",
+                  if any(
+                      info.get("doppelspieler")
+                      or info.get("idShortSinglePlayer1")
+                      or stat.get("doppelpartnerid")
+                      or "/" in (archive.get(f"player{side}Name") or "")
+                      or any(d.get("doppelpartnerId") for d in details)
+                      for side, pid, stat, details, info in sides
+                  ):
+                      totals["doubles"] += 1
+                      continue
+
+                  if not all(
+                      pid and stat and details
+                      for side, pid, stat, details, info in sides
+                  ):
+                      totals["unclear"] += 1
+                      continue
+
+                  if not all(
+                      info.get("einzelspieler") is True
+                      or (league and ref.get("type") == "EZ")
+                      for side, pid, stat, details, info in sides
+                  ):
+                      totals["unclear"] += 1
+                      continue
+
+                  scores = {
+                      item["gamedetailId"]: item.get("scores") or []
+                      for item in archive.get("scores") or []
+                  }
+
+                  match = upsert(
+                      "pc_matches",
+                      {
+                          "event_id": event["id"],
+                          "darthelfer_match_id": match_id,
+                          "darthelfer_game_id": archive["gameid"],
+                          "source_tournament_id": source_id,
+                          "match_type": "singles",
+                          "played_at": timestamp(archive.get("startzeitpunkt")),
+                          "started_at": timestamp(archive.get("startzeitpunkt")),
+                          "finished_at": timestamp(archive.get("endezeitpunkt")),
+                          "duration_minutes": archive.get("dauer"),
+                          "is_finished": True,
+                          "archive_available": True,
+                          "raw_data": archive,
+                          "synced_at": now()
+                      },
+                      "event_id,darthelfer_match_id"
+                  )[0]
+
+                  totals["matches"] += 1
+
+                  for side, player_id, stat, details, info in sides:
+
+                      attempts = stat.get("anzahlDoppelwuerfe")
+                      double_known = attempts is not None and attempts > 0
+
+                      highs = stat.get("highscores")
+                      finishes = []
+                      leg_lengths = []
+
+                      for detail in details:
+                          if not detail.get("gewonnen"):
+                              continue
+                          if not detail.get("abgeschlossen"):
+                              continue
+                          if detail.get("wuerfe"):
+                              leg_lengths.append(detail["wuerfe"])
+
+                          for score in scores.get(detail["id"], []):
+                              if (
+                                  score.get("scoregueltig") is True
+                                  and score.get("togo") == 0
+                                  and score.get("aufnahme") is not None
+                              ):
+                                  finishes.append(score["aufnahme"])
+
+                      player = upsert(
+                          "pc_match_players",
                           {
-                              "match_player_id": player["id"],
-                              "darthelfer_detail_id": detail["id"],
-                              "set_number": detail.get("setNumber") or 1,
-                              "leg_number": detail["leg"],
-                              "won": detail.get("gewonnen"),
-                              "scored_points": detail.get("anzahlGeworfenerPunkte"),
-                              "darts_thrown": detail.get("wuerfe"),
-                              "average": detail.get("average"),
-                              "first9_average": detail.get("first9Average"),
-                              "checkout": checkout,
-                              "double_attempts": detail.get("anzahlDoppelwuerfe"),
-                              "raw_data": detail
+                              "match_id": match["id"],
+                              "darthelfer_player_id": player_id,
+                              "darthelfer_user_id": (
+                                  stat.get("userid") or info.get("userId")
+                              ),
+                              "nuliga_person_id": info.get("externPersonId"),
+                              "nuliga_player_id": info.get("externPlayerId"),
+                              "is_home_player": (
+                                  info.get("heimmannschaft") if league else None
+                              ),
+                              "player_name": archive.get(f"player{side}Name"),
+                              "player_side": side,
+                              "won": (
+                                  archive.get("gewonnenPlayerid") == player_id
+                                  if archive.get("gewonnenPlayerid") else None
+                              ),
+                              "legs_won": stat.get("gewonneneLegs"),
+                              "legs_lost": stat.get("verloreneLegs"),
+                              "scored_points": stat.get("anzahlGeworfenerPunkteGesamt"),
+                              "darts_thrown": stat.get("anzahlWuerfeGesamt"),
+                              "average": stat.get("average"),
+                              "first9_average": stat.get("first9Average"),
+                              "first12_average": stat.get("first12Average"),
+                              "first15_average": stat.get("first15Average"),
+                              "first9_points": stat.get("anzahlGeworfenerPunkteFirst9"),
+                              "first9_darts": stat.get("anzahlWuerfeFirst9"),
+                              "first12_points": stat.get("anzahlGeworfenerPunkteFirst12"),
+                              "first12_darts": stat.get("anzahlWuerfeFirst12"),
+                              "first15_points": stat.get("anzahlGeworfenerPunkteFirst15"),
+                              "first15_darts": stat.get("anzahlWuerfeFirst15"),
+                              "count_100": (
+                                  sum(100 <= n < 140 for n in highs)
+                                  if highs is not None else None
+                              ),
+                              "count_140": (
+                                  sum(140 <= n < 180 for n in highs)
+                                  if highs is not None else None
+                              ),
+                              "count_180": stat.get("_180er"),
+                              "highest_finish": max(finishes, default=None),
+                              "shortest_leg": min(leg_lengths, default=None),
+                              "longest_leg": max(leg_lengths, default=None),
+                              "double_attempts": attempts if double_known else None,
+                              "double_hits": (
+                                  stat.get("anzahlDoppelgetroffen")
+                                  if double_known else None
+                              ),
+                              "double_percentage": (
+                                  stat.get("doppelquote")
+                                  if double_known else None
+                              ),
+                              "raw_data": stat
                           },
-                          "darthelfer_detail_id"
+                          "match_id,darthelfer_player_id"
                       )[0]
 
-                      totals["legs"] += 1
+                      totals["players"] += 1
 
-                      remaining = None
-                      visit_number = 0
-                      records = []
+                      for detail in details:
 
-                      for score in visits:
+                          visits = scores.get(detail["id"], [])
 
-                          if score.get("id") is None:
-                              remaining = score.get("togo")
-                              continue
-
-                          visit_number += 1
-
-                          records.append({
-                              "leg_id": leg["id"],
-                              "darthelfer_score_id": score["id"],
-                              "visit_number": visit_number,
-                              "points": score.get("aufnahme"),
-                              "remaining_before": remaining,
-                              "remaining_after": score.get("togo"),
-                              "darts_used": score.get("anzahlWuerfe"),
-                              "dart1": score.get("wurf1"),
-                              "dart2": score.get("wurf2"),
-                              "dart3": score.get("wurf3"),
-                              "double_attempts": score.get("anzahlDoppelwuerfe"),
-                              "is_valid": score.get("scoregueltig"),
-                              "is_checkout": (
-                                  score.get("togo") == 0
-                                  and score.get("scoregueltig") is True
+                          checkout = next(
+                              (
+                                  s["aufnahme"]
+                                  for s in visits
+                                  if s.get("scoregueltig") is True
+                                  and s.get("togo") == 0
+                                  and s.get("aufnahme") is not None
                                   and detail.get("gewonnen") is True
+                                  and detail.get("abgeschlossen") is True
                               ),
-                              "raw_data": score
-                          })
-
-                          remaining = score.get("togo")
-
-                      if records:
-                          upsert(
-                              "pc_throws",
-                              records,
-                              "leg_id,visit_number"
+                              None
                           )
 
-                          totals["throws"] += len(records)
+                          leg = upsert(
+                              "pc_legs",
+                              {
+                                  "match_player_id": player["id"],
+                                  "darthelfer_detail_id": detail["id"],
+                                  "set_number": detail.get("setNumber") or 1,
+                                  "leg_number": detail["leg"],
+                                  "won": detail.get("gewonnen"),
+                                  "scored_points": detail.get("anzahlGeworfenerPunkte"),
+                                  "darts_thrown": detail.get("wuerfe"),
+                                  "average": detail.get("average"),
+                                  "first9_average": detail.get("first9Average"),
+                                  "checkout": checkout,
+                                  "double_attempts": detail.get("anzahlDoppelwuerfe"),
+                                  "raw_data": detail
+                              },
+                              "darthelfer_detail_id"
+                          )[0]
 
-              print(f"Matches verarbeitet: {totals['matches']}")
+                          totals["legs"] += 1
 
-              time.sleep(0.3)
+                          remaining = None
+                          records = []
+
+                          for score in visits:
+
+                              if score.get("id") is None:
+                                  remaining = score.get("togo")
+                                  continue
+
+                              records.append({
+                                  "leg_id": leg["id"],
+                                  "darthelfer_score_id": score["id"],
+                                  "visit_number": len(records) + 1,
+                                  "points": score.get("aufnahme"),
+                                  "remaining_before": remaining,
+                                  "remaining_after": score.get("togo"),
+                                  "darts_used": score.get("anzahlWuerfe"),
+                                  "dart1": score.get("wurf1"),
+                                  "dart2": score.get("wurf2"),
+                                  "dart3": score.get("wurf3"),
+                                  "double_attempts": score.get("anzahlDoppelwuerfe"),
+                                  "is_valid": score.get("scoregueltig"),
+                                  "is_checkout": (
+                                      score.get("togo") == 0
+                                      and score.get("scoregueltig") is True
+                                      and detail.get("gewonnen") is True
+                                      and detail.get("abgeschlossen") is True
+                                  ),
+                                  "raw_data": score
+                              })
+
+                              remaining = score.get("togo")
+
+                          if records:
+                              upsert(
+                                  "pc_throws",
+                                  records,
+                                  "leg_id,visit_number"
+                              )
+                              totals["throws"] += len(records)
+
+                  print(f"Einzelmatches importiert: {totals['matches']}")
+                  time.sleep(0.3)
+
+          print("DART LIONS PLAYER CENTER")
+
+          log = request_json(
+              URL + "/rest/v1/pc_sync_log",
+              {"status": "running"},
+              HEADERS,
+              "POST"
+          )[0]
+
+          try:
+              for event_id in EVENT_IDS:
+                  import_event(event_id)
+
+              incomplete = totals["missing"] or totals["unclear"]
+
+              patch(
+                  "pc_sync_log",
+                  log["id"],
+                  {
+                      "finished_at": now(),
+                      "status": "partial" if incomplete else "success",
+                      "events_imported": totals["events"],
+                      "matches_imported": totals["matches"],
+                      "error_message": (
+                          f"Fehlende Archive: {totals['missing']}, "
+                          f"Unklare Matches: {totals['unclear']}"
+                          if incomplete else None
+                      )
+                  }
+              )
+
+          except Exception as error:
+              patch(
+                  "pc_sync_log",
+                  log["id"],
+                  {
+                      "finished_at": now(),
+                      "status": "failed",
+                      "events_imported": totals["events"],
+                      "matches_imported": totals["matches"],
+                      "error_message": type(error).__name__
+                  }
+              )
+              raise
 
           print("------------------------------")
           print("IMPORT ABGESCHLOSSEN")
-          print(f"Matches: {totals['matches']}")
-          print(f"Spieler-Matchdatensätze: {totals['players']}")
-          print(f"Spieler-Legdatensätze: {totals['legs']}")
+          print(f"Veranstaltungen: {totals['events']}")
+          print(f"Einzelmatches: {totals['matches']}")
+          print(f"Spielerstatistiken: {totals['players']}")
+          print(f"Legstatistiken: {totals['legs']}")
           print(f"Aufnahmen: {totals['throws']}")
+          print(f"Doppel ausgeschlossen: {totals['doubles']}")
           print(f"Fehlende Archive: {totals['missing']}")
+          print(f"Unklare Matches: {totals['unclear']}")
           print("GAME ON!")
           PY
