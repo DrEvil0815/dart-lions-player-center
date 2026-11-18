@@ -1,0 +1,206 @@
+
+name: Dart Lions Player Center - Historie
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Veranstaltungshistorie analysieren
+        run: |
+          python3 - <<'PY'
+          import json
+          import time
+          import urllib.request
+          from datetime import datetime
+          from collections import Counter
+
+          BASE = "https://www.darthelfer.de/api/public"
+          OPERATOR = "7a088d28-63ee-49ac-a1fc-fe726056ddbe"
+
+          def get_json(url):
+              with urllib.request.urlopen(url, timeout=45) as response:
+                  return json.load(response)
+
+          data = get_json(
+              BASE + "/eventoperator/" + OPERATOR
+          )
+
+          events = data.get("allTournamentsClosed") or []
+
+          events.sort(
+              key=lambda e: datetime.strptime(
+                  e["beginnString"], "%d.%m.%Y"
+              ) if e.get("beginnString") else datetime.min
+          )
+
+          results = []
+          children = set()
+
+          for event in events:
+              event_id = event["id"]
+              name = event.get("bezeichnung") or "Unbekannt"
+              date = event.get("beginnString") or ""
+
+              try:
+                  detail = get_json(
+                      BASE + "/tournament/" + event_id
+                  )
+
+                  main = detail.get("turnierMain") or {}
+                  group = detail.get("turnierGruppe") or {}
+                  info = main or group
+
+                  for part in (main, group):
+                      for field in (
+                          "goldTurnierId",
+                          "silberTurnierId",
+                          "bronzeTurnierId"
+                      ):
+                          if part.get(field):
+                              children.add(part[field])
+
+                  league = (
+                      info.get("turniersystem") == "LIGASPIELTAG"
+                  )
+
+                  if not info:
+                      category = "UNBEKANNT"
+
+                  elif (
+                      main.get("doppelturnier")
+                      or group.get("doppelturnier")
+                      or main.get("dyp")
+                      or group.get("dyp")
+                  ):
+                      category = "DOPPEL"
+
+                  elif "test" in name.lower():
+                      category = "TEST"
+
+                  elif league:
+                      category = "LIGA"
+
+                  elif "competition" in name.lower():
+                      category = "COMPETITION"
+
+                  elif "training" in name.lower():
+                      category = "TRAINING"
+
+                  else:
+                      category = "TURNIER"
+
+                  if league:
+                      games = info.get(
+                          "tournamentLeagueGameEntities"
+                      ) or []
+
+                      matches = sum(
+                          g.get("type") == "EZ"
+                          for g in games
+                      )
+                  else:
+                      matches = len(
+                          detail.get("tournamentGames") or []
+                      )
+
+                  results.append({
+                      "id": event_id,
+                      "name": name,
+                      "date": date,
+                      "category": category,
+                      "matches": matches
+                  })
+
+              except Exception as error:
+                  results.append({
+                      "id": event_id,
+                      "name": name,
+                      "date": date,
+                      "category": "FEHLER",
+                      "matches": 0
+                  })
+
+                  print(
+                      f"Fehler bei {name}: "
+                      f"{type(error).__name__}"
+                  )
+
+              time.sleep(0.4)
+
+          print("=" * 65)
+          print("DART LIONS PLAYER CENTER")
+          print("VERANSTALTUNGSHISTORIE")
+          print("=" * 65)
+
+          counts = Counter()
+          candidates = []
+          total_matches = 0
+
+          for event in results:
+
+              if event["id"] in children:
+                  event["category"] = "UNTERTURNIER"
+
+              category = event["category"]
+              counts[category] += 1
+
+              print(
+                  f"{event['date']} | "
+                  f"{category} | "
+                  f"{event['name']} | "
+                  f"Matchreferenzen: {event['matches']}"
+              )
+
+              if category in (
+                  "COMPETITION",
+                  "LIGA",
+                  "TURNIER",
+                  "TRAINING"
+              ):
+                  candidates.append(event)
+                  total_matches += event["matches"]
+
+          print("=" * 65)
+          print("ZUSAMMENFASSUNG")
+          print("=" * 65)
+
+          print(f"Veranstaltungen gesamt: {len(events)}")
+
+          for category, count in sorted(counts.items()):
+              print(f"{category}: {count}")
+
+          print(
+              f"Importkandidaten: {len(candidates)}"
+          )
+
+          print(
+              f"Matchreferenzen: {total_matches}"
+          )
+
+          print("=" * 65)
+          print("IMPORTPAKETE")
+          print("=" * 65)
+
+          for pos in range(0, len(candidates), 10):
+
+              batch = candidates[pos:pos + 10]
+
+              print(f"PAKET {pos // 10 + 1}")
+
+              for event in batch:
+                  print(
+                      f"{event['id']} | {event['name']}"
+                  )
+
+          print("=" * 65)
+          print("ANALYSE ABGESCHLOSSEN")
+          print("GAME ON!")
+          PY
