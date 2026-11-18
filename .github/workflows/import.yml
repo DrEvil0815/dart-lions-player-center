@@ -35,18 +35,16 @@ jobs:
           BASE = "https://www.darthelfer.de/api/public"
 
           EVENT_IDS = [
-              EVENT_IDS = [
-                "3b5bcc93-d1ed-4695-adf9-13f755450c3f",
-                "a136686d-6182-4918-b936-432b8978c859",
-                "ddcec65f-33e5-438f-80a0-94f9c8019e5e",
-                "0ef2bcb2-afe6-4ea0-9550-d07f98efce5c",
-                "959a5b8e-f7ea-4f8a-b034-289b57677eea",
-                "be7a5386-fa5b-4e49-a948-62e04c4d596d",
-                "4ef8e2ed-e2bb-403e-a443-760a732ddfdf",
-                "32e04b0e-9a8d-4f92-98ff-937e101a3ede",
-                "7cb3f044-b3d3-4716-b2db-414c912cecde",
-                "892a3615-4231-4705-93fe-6e602cd8566d"
-]
+              "3b5bcc93-d1ed-4695-adf9-13f755450c3f",
+              "a136686d-6182-4918-b936-432b8978c859",
+              "ddcec65f-33e5-438f-80a0-94f9c8019e5e",
+              "0ef2bcb2-afe6-4ea0-9550-d07f98efce5c",
+              "959a5b8e-f7ea-4f8a-b034-289b57677eea",
+              "be7a5386-fa5b-4e49-a948-62e04c4d596d",
+              "4ef8e2ed-e2bb-403e-a443-760a732ddfdf",
+              "32e04b0e-9a8d-4f92-98ff-937e101a3ede",
+              "7cb3f044-b3d3-4716-b2db-414c912cecde",
+              "892a3615-4231-4705-93fe-6e602cd8566d"
           ]
 
           URL = (
