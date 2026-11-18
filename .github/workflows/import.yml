@@ -1,0 +1,96 @@
+
+name: Dart Lions Player Center - Import
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Darthelfer Testimport
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.request
+          from datetime import datetime
+
+          OPERATOR_ID = "7a088d28-63ee-49ac-a1fc-fe726056ddbe"
+          TEST_EVENT_ID = "cb3ed76e-935b-4f38-835c-f91eab283776"
+
+          SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+          SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+          if not SUPABASE_URL or not SUPABASE_KEY:
+              raise RuntimeError("Supabase-Zugangsdaten fehlen")
+
+          api_url = (
+              "https://www.darthelfer.de/api/public/eventoperator/"
+              + OPERATOR_ID
+          )
+
+          print("Rufe Darthelfer-Veranstaltungen ab ...")
+
+          with urllib.request.urlopen(api_url, timeout=30) as response:
+              data = json.load(response)
+
+          active = data.get("allTournamentsStarted", [])
+          upcoming = data.get("allTournamentsNew", [])
+          closed = data.get("allTournamentsClosed", [])
+
+          print(f"Geplante Veranstaltungen: {len(upcoming)}")
+          print(f"Laufende Veranstaltungen: {len(active)}")
+          print(f"Abgeschlossene Veranstaltungen: {len(closed)}")
+
+          event = next(
+              (e for e in closed if e["id"] == TEST_EVENT_ID),
+              None
+          )
+
+          if event is None:
+              raise RuntimeError("Testveranstaltung nicht gefunden")
+
+          record = {
+              "darthelfer_event_id": event["id"],
+              "event_name": event["bezeichnung"],
+              "event_type": "competition",
+              "event_date": datetime.strptime(
+                  event["beginnString"], "%d.%m.%Y"
+              ).date().isoformat(),
+              "is_finished": True,
+              "raw_data": event
+          }
+
+          headers = {
+              "apikey": SUPABASE_KEY,
+              "Content-Type": "application/json",
+              "Prefer": "resolution=merge-duplicates,return=minimal"
+          }
+
+          if not SUPABASE_KEY.startswith("sb_secret_"):
+              headers["Authorization"] = "Bearer " + SUPABASE_KEY
+
+          request = urllib.request.Request(
+              SUPABASE_URL
+              + "/rest/v1/pc_events"
+              + "?on_conflict=darthelfer_event_id",
+              data=json.dumps(record).encode("utf-8"),
+              headers=headers,
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              print(f"Supabase HTTP-Status: {response.status}")
+
+          print("Testimport erfolgreich!")
+          print("Veranstaltung: " + event["bezeichnung"])
+          PY
