@@ -3,6 +3,8 @@ name: Dart Lions Player Center - Import
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
 
 permissions:
   contents: read
@@ -14,10 +16,10 @@ concurrency:
 jobs:
   import:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
-      - name: Darthelfer Einzelspielimport
+      - name: Automatischer Darthelfer Einzelspielimport
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -28,24 +30,16 @@ jobs:
           import time
           import urllib.request
           import urllib.error
+          import urllib.parse
           from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
           from collections import Counter
 
           BASE = "https://www.darthelfer.de/api/public"
 
-          EVENT_IDS = [
-              "3b5bcc93-d1ed-4695-adf9-13f755450c3f",
-              "a136686d-6182-4918-b936-432b8978c859",
-              "ddcec65f-33e5-438f-80a0-94f9c8019e5e",
-              "0ef2bcb2-afe6-4ea0-9550-d07f98efce5c",
-              "959a5b8e-f7ea-4f8a-b034-289b57677eea",
-              "be7a5386-fa5b-4e49-a948-62e04c4d596d",
-              "4ef8e2ed-e2bb-403e-a443-760a732ddfdf",
-              "32e04b0e-9a8d-4f92-98ff-937e101a3ede",
-              "7cb3f044-b3d3-4716-b2db-414c912cecde",
-              "892a3615-4231-4705-93fe-6e602cd8566d"
-          ]
+          OPERATOR_ID = (
+              "7a088d28-63ee-49ac-a1fc-fe726056ddbe"
+          )
 
           URL = (
               os.environ["SUPABASE_URL"]
@@ -54,24 +48,37 @@ jobs:
               .removesuffix("/rest/v1")
           )
 
-          KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip()
+          KEY = os.environ[
+              "SUPABASE_SERVICE_ROLE_KEY"
+          ].strip()
 
           if not URL or not KEY:
-              raise RuntimeError("Supabase-Zugangsdaten fehlen")
+              raise RuntimeError(
+                  "Supabase-Zugangsdaten fehlen"
+              )
 
           HEADERS = {
               "apikey": KEY,
               "Content-Type": "application/json",
-              "Prefer": "resolution=merge-duplicates,return=representation"
+              "Prefer": (
+                  "resolution=merge-duplicates,"
+                  "return=representation"
+              )
           }
 
           if not KEY.startswith("sb_secret_"):
               HEADERS["Authorization"] = "Bearer " + KEY
 
+          START_TIME = time.monotonic()
+          MAX_RUNTIME = 150 * 60
+
           def now():
-              return datetime.now(timezone.utc).isoformat()
+              return datetime.now(
+                  timezone.utc
+              ).isoformat()
 
           def timestamp(value):
+
               if not value:
                   return None
 
@@ -86,12 +93,27 @@ jobs:
 
               return dt.isoformat()
 
+          def event_date(value):
+
+              if not value:
+                  return None
+
+              try:
+                  return datetime.strptime(
+                      value,
+                      "%d.%m.%Y"
+                  ).date().isoformat()
+
+              except ValueError:
+                  return None
+
           def request_json(
               url,
               data=None,
               headers=None,
               method="GET"
           ):
+
               req = urllib.request.Request(
                   url,
                   data=(
@@ -104,10 +126,13 @@ jobs:
                   method=method
               )
 
-              for attempt in range(3):
+              for attempt in range(4):
+
                   try:
+
                       with urllib.request.urlopen(
-                          req, timeout=45
+                          req,
+                          timeout=45
                       ) as response:
 
                           body = response.read()
@@ -124,21 +149,32 @@ jobs:
                       ):
                           raise
 
-                      if attempt == 2:
+                      if attempt == 3:
                           raise
 
-                      time.sleep(3 * (attempt + 1))
+                      wait = 5 * (2 ** attempt)
 
-                  except (urllib.error.URLError, TimeoutError):
+                      print(
+                          f"HTTP {error.code} - "
+                          f"erneuter Versuch in {wait} Sekunden"
+                      )
 
-                      if attempt == 2:
+                      time.sleep(wait)
+
+                  except (
+                      urllib.error.URLError,
+                      TimeoutError
+                  ):
+
+                      if attempt == 3:
                           raise
 
-                      time.sleep(3 * (attempt + 1))
+                      time.sleep(5 * (2 ** attempt))
 
           def upsert(table, data, conflict):
 
               try:
+
                   return request_json(
                       URL + "/rest/v1/" + table
                       + "?on_conflict=" + conflict,
@@ -168,8 +204,71 @@ jobs:
                   "PATCH"
               )
 
+          def db_get(table, params):
+
+              return request_json(
+                  URL + "/rest/v1/" + table
+                  + "?"
+                  + urllib.parse.urlencode(params),
+                  headers=HEADERS
+              )
+
+          def get_existing_events():
+
+              result = []
+              offset = 0
+
+              while True:
+
+                  rows = db_get(
+                      "pc_events",
+                      {
+                          "select": (
+                              "id,darthelfer_event_id,"
+                              "event_name,import_status,"
+                              "import_attempts"
+                          ),
+                          "order": "id.asc",
+                          "limit": 500,
+                          "offset": offset
+                      }
+                  ) or []
+
+                  result.extend(rows)
+
+                  if len(rows) < 500:
+                      break
+
+                  offset += 500
+
+              return {
+                  row["darthelfer_event_id"]: row
+                  for row in result
+              }
+
+          def get_event_type(name, system):
+
+              name_lower = name.lower()
+
+              if system == "LIGASPIELTAG":
+                  return "league"
+
+              if "competition" in name_lower:
+                  return "competition"
+
+              if "training" in name_lower:
+                  return "training"
+
+              return "tournament"
+
           totals = {
-              "events": 0,
+              "events_found": 0,
+              "events_completed": 0,
+              "events_already_completed": 0,
+              "events_failed": 0,
+              "events_partial": 0,
+              "events_excluded": 0,
+              "events_deferred": 0,
               "matches": 0,
               "players": 0,
               "legs": 0,
@@ -178,11 +277,12 @@ jobs:
               "missing": 0,
               "unclear": 0,
               "historical": 0,
-              "duplicates": 0,
-              "skipped_events": 0
+              "duplicates": 0
           }
 
           reasons = Counter()
+          failed_events = []
+          partial_events = []
 
           def unclear(reason, match_id):
 
@@ -190,7 +290,8 @@ jobs:
               reasons[reason] += 1
 
               print(
-                  f"Match übersprungen: {match_id} | {reason}"
+                  f"Match übersprungen: "
+                  f"{match_id} | {reason}"
               )
 
           def doubles(reason, match_id):
@@ -198,7 +299,8 @@ jobs:
               totals["doubles"] += 1
 
               print(
-                  f"Doppel ausgeschlossen: {match_id} | {reason}"
+                  f"Doppel ausgeschlossen: "
+                  f"{match_id} | {reason}"
               )
 
           def is_double_player(info):
@@ -235,7 +337,8 @@ jobs:
                           if p.get("id"):
 
                               current = lookup.setdefault(
-                                  p["id"], {}
+                                  p["id"],
+                                  {}
                               )
 
                               current.update({
@@ -244,10 +347,31 @@ jobs:
                                   if v is not None
                               })
 
-          def import_event(event_id):
+          def status_update(event, status, error=None):
+
+              data = {
+                  "import_status": status,
+                  "import_error": error,
+                  "synced_at": now()
+              }
+
+              if status == "completed":
+                  data["import_completed_at"] = now()
+
+              else:
+                  data["import_completed_at"] = None
+
+              patch(
+                  "pc_events",
+                  event["id"],
+                  data
+              )
+
+          def import_event(event_id, event):
 
               matches_before = totals["matches"]
               unclear_before = totals["unclear"]
+              missing_before = totals["missing"]
 
               tournament = request_json(
                   BASE + "/tournament/" + event_id
@@ -265,6 +389,7 @@ jobs:
               )
 
               if not main:
+
                   raise RuntimeError(
                       "Turnierstruktur nicht erkannt"
                   )
@@ -272,12 +397,8 @@ jobs:
               name = (
                   group.get("bezeichnung")
                   or main.get("bezeichnung")
+                  or event["event_name"]
               )
-
-              if not name:
-                  raise RuntimeError(
-                      "Veranstaltungsname fehlt"
-                  )
 
               print("------------------------------")
               print(name)
@@ -287,16 +408,22 @@ jobs:
                   or group.get("doppelturnier")
                   or main.get("dyp")
                   or group.get("dyp")
+                  or "test" in name.lower()
+                  or "weihnachtsspezial k.o." in name.lower()
               ):
 
-                  print("Doppelturnier ausgeschlossen")
-                  totals["skipped_events"] += 1
-                  return
+                  status_update(
+                      event,
+                      "excluded",
+                      "Doppel- oder Testveranstaltung"
+                  )
 
-              if "test" in name.lower():
+                  totals["events_excluded"] += 1
 
-                  print("Testveranstaltung ausgeschlossen")
-                  totals["skipped_events"] += 1
+                  print(
+                      "Veranstaltung ausgeschlossen"
+                  )
+
                   return
 
               league = (
@@ -304,17 +431,16 @@ jobs:
                   or group.get("turniersystem") == "LIGASPIELTAG"
               )
 
-              if league:
-                  event_type = "league"
+              system = (
+                  "LIGASPIELTAG"
+                  if league
+                  else main.get("turniersystem")
+              )
 
-              elif "competition" in name.lower():
-                  event_type = "competition"
-
-              elif "training" in name.lower():
-                  event_type = "training"
-
-              else:
-                  event_type = "tournament"
+              event_type = get_event_type(
+                  name,
+                  system
+              )
 
               finished = (
                   main.get("tournamentstatus") == "abgeschlossen"
@@ -323,13 +449,30 @@ jobs:
 
               if not finished:
 
-                  print(
-                      "Nicht abgeschlossene Veranstaltung "
-                      "übersprungen"
+                  raise RuntimeError(
+                      "Veranstaltung nicht abgeschlossen"
                   )
 
-                  totals["skipped_events"] += 1
-                  return
+              patch(
+                  "pc_events",
+                  event["id"],
+                  {
+                      "event_name": name,
+                      "event_type": event_type,
+                      "event_date": event_date(
+                          group.get("beginnString")
+                          or main.get("beginnString")
+                      ),
+                      "is_finished": True,
+                      "home_team": main.get(
+                          "mannschaftHeim"
+                      ),
+                      "away_team": main.get(
+                          "mannschaftGast"
+                      ),
+                      "synced_at": now()
+                  }
+              )
 
               player_lookup = {}
 
@@ -350,7 +493,11 @@ jobs:
 
                       child_id = part.get(field)
 
-                      if child_id and child_id != event_id:
+                      if (
+                          child_id
+                          and child_id != event_id
+                      ):
+
                           child_ids.add(child_id)
 
               checked_children = set()
@@ -368,7 +515,9 @@ jobs:
                   try:
 
                       child = request_json(
-                          BASE + "/tournament/" + source_id
+                          BASE
+                          + "/tournament/"
+                          + source_id
                       )
 
                       collect_players(
@@ -393,8 +542,12 @@ jobs:
               if league:
 
                   games = (
-                      main.get("tournamentLeagueGameEntities")
-                      or group.get("tournamentLeagueGameEntities")
+                      main.get(
+                          "tournamentLeagueGameEntities"
+                      )
+                      or group.get(
+                          "tournamentLeagueGameEntities"
+                      )
                       or []
                   )
 
@@ -405,37 +558,42 @@ jobs:
                       or []
                   )
 
-              print(f"Matchreferenzen: {len(games)}")
-
-              date_string = (
-                  group.get("beginnString")
-                  or main.get("beginnString")
+              print(
+                  f"Matchreferenzen: {len(games)}"
               )
 
-              event = upsert(
-                  "pc_events",
-                  {
-                      "darthelfer_event_id": event_id,
-                      "event_name": name,
-                      "event_type": event_type,
-                      "event_date": datetime.strptime(
-                          date_string,
-                          "%d.%m.%Y"
-                      ).date().isoformat(),
-                      "is_finished": True,
-                      "home_team": main.get("mannschaftHeim"),
-                      "away_team": main.get("mannschaftGast"),
-                      "synced_at": now()
-                  },
-                  "darthelfer_event_id"
-              )[0]
+              if not games:
 
-              totals["events"] += 1
+                  message = (
+                      "Keine Matchreferenzen vorhanden"
+                  )
+
+                  status_update(
+                      event,
+                      "partial",
+                      message
+                  )
+
+                  totals["events_partial"] += 1
+                  partial_events.append(name)
+
+                  print(message)
+                  return
 
               seen = set()
               seen_archives = set()
 
               for ref in games:
+
+                  if (
+                      time.monotonic() - START_TIME
+                      > MAX_RUNTIME
+                  ):
+
+                      raise RuntimeError(
+                          "Zeitlimit erreicht - "
+                          "Fortsetzung beim nächsten Import"
+                      )
 
                   match_id = (
                       ref.get("tournamentGameId")
@@ -511,8 +669,10 @@ jobs:
                   seen.add(identity)
 
                   archive_url = (
-                      BASE + "/gameausarchiv/x01/"
-                      + source_id + "/"
+                      BASE
+                      + "/gameausarchiv/x01/"
+                      + source_id
+                      + "/"
                       + match_id
                       + "/tournamentgameid"
                   )
@@ -537,7 +697,10 @@ jobs:
 
                       raise
 
-                  if not archive or not archive.get("gameid"):
+                  if (
+                      not archive
+                      or not archive.get("gameid")
+                  ):
 
                       totals["missing"] += 1
 
@@ -547,14 +710,25 @@ jobs:
 
                       continue
 
-                  if archive["gameid"] in seen_archives:
+                  if (
+                      archive["gameid"]
+                      in seen_archives
+                  ):
 
                       totals["duplicates"] += 1
                       continue
 
-                  player1_id = archive.get("player1Id")
-                  player2_id = archive.get("player2Id")
-                  winner_id = archive.get("gewonnenPlayerid")
+                  player1_id = archive.get(
+                      "player1Id"
+                  )
+
+                  player2_id = archive.get(
+                      "player2Id"
+                  )
+
+                  winner_id = archive.get(
+                      "gewonnenPlayerid"
+                  )
 
                   if (
                       not player1_id
@@ -563,7 +737,8 @@ jobs:
                   ):
 
                       unclear(
-                          "Spieler-IDs fehlen oder sind identisch",
+                          "Spieler-IDs fehlen "
+                          "oder sind identisch",
                           match_id
                       )
 
@@ -575,7 +750,10 @@ jobs:
                           player1_id,
                           player2_id
                       )
-                  ) or archive.get("unentschieden") is True
+                  ) or (
+                      archive.get("unentschieden")
+                      is True
+                  )
 
                   details1 = (
                       archive.get("gameDetailsPlayer1")
@@ -606,7 +784,8 @@ jobs:
                   if not legs_completed:
 
                       unclear(
-                          "Legs fehlen oder sind nicht abgeschlossen",
+                          "Legs fehlen oder sind "
+                          "nicht abgeschlossen",
                           match_id
                       )
 
@@ -637,7 +816,8 @@ jobs:
                       )
 
                       info = player_lookup.get(
-                          player_id, {}
+                          player_id,
+                          {}
                       )
 
                       sides.append(
@@ -654,7 +834,9 @@ jobs:
                       is_double_player(info)
                       or stat.get("doppelpartnerid")
                       or "/" in (
-                          archive.get(f"player{side}Name")
+                          archive.get(
+                              f"player{side}Name"
+                          )
                           or ""
                       )
                       or any(
@@ -708,7 +890,10 @@ jobs:
                   )
 
                   if not (
-                      (league and ref.get("type") == "EZ")
+                      (
+                          league
+                          and ref.get("type") == "EZ"
+                      )
                       or explicit_singles
                       or single_event
                   ):
@@ -733,7 +918,7 @@ jobs:
                   if not consistent_players:
 
                       unclear(
-                          "Spielerzuordnung im Archiv widersprüchlich",
+                          "Spielerzuordnung widersprüchlich",
                           match_id
                       )
 
@@ -743,7 +928,9 @@ jobs:
                       item["gamedetailId"]: (
                           item.get("scores") or []
                       )
-                      for item in archive.get("scores") or []
+                      for item in (
+                          archive.get("scores") or []
+                      )
                   }
 
                   if not scores:
@@ -754,6 +941,53 @@ jobs:
                       )
 
                       continue
+
+                  existing_match = db_get(
+                      "pc_matches",
+                      {
+                          "select": (
+                              "id,event_id,"
+                              "darthelfer_match_id"
+                          ),
+                          "darthelfer_game_id": (
+                              "eq." + archive["gameid"]
+                          ),
+                          "limit": 2
+                      }
+                  ) or []
+
+                  if len(existing_match) > 1:
+
+                      unclear(
+                          "Mehrfach gespeicherte Archiv-ID",
+                          match_id
+                      )
+
+                      continue
+
+                  if existing_match:
+
+                      old_match = existing_match[0]
+
+                      if (
+                          old_match["event_id"]
+                          != event["id"]
+                          or old_match["darthelfer_match_id"]
+                          != match_id
+                      ):
+
+                          totals["duplicates"] += 1
+
+                          seen_archives.add(
+                              archive["gameid"]
+                          )
+
+                          print(
+                              "Archiv bereits unter "
+                              "anderer Referenz gespeichert"
+                          )
+
+                          continue
 
                   historical = not archive.get(
                       "endezeitpunkt"
@@ -774,7 +1008,8 @@ jobs:
                               timestamp(
                                   archive.get("startzeitpunkt")
                               )
-                              if not historical else None
+                              if not historical
+                              else None
                           ),
                           "finished_at": timestamp(
                               archive.get("endezeitpunkt")
@@ -821,7 +1056,8 @@ jobs:
                               )
 
                           for score in scores.get(
-                              detail["id"], []
+                              detail["id"],
+                              []
                           ):
 
                               if (
@@ -834,13 +1070,10 @@ jobs:
                                       score["aufnahme"]
                                   )
 
-                      highfinishes = (
-                          stat.get("highfinishes")
-                          or []
-                      )
-
                       finishes.extend(
-                          n for n in highfinishes
+                          n for n in (
+                              stat.get("highfinishes") or []
+                          )
                           if isinstance(n, (int, float))
                           and 0 < n <= 170
                       )
@@ -980,7 +1213,8 @@ jobs:
                       for detail in details:
 
                           visits = scores.get(
-                              detail["id"], []
+                              detail["id"],
+                              []
                           )
 
                           checkout = next(
@@ -1092,32 +1326,76 @@ jobs:
                   totals["matches"] += 1
 
                   if historical:
+
                       totals["historical"] += 1
 
                   print(
-                      f"Einzelmatches importiert: "
+                      "Einzelmatches importiert: "
                       f"{totals['matches']}"
                   )
 
                   time.sleep(0.3)
 
+              event_matches = (
+                  totals["matches"] - matches_before
+              )
+
+              event_unclear = (
+                  totals["unclear"] - unclear_before
+              )
+
+              event_missing = (
+                  totals["missing"] - missing_before
+              )
+
+              if event_unclear or event_missing:
+
+                  error = (
+                      f"Unklare Matches: {event_unclear}, "
+                      f"fehlende Archive: {event_missing}"
+                  )
+
+                  status_update(
+                      event,
+                      "partial",
+                      error
+                  )
+
+                  totals["events_partial"] += 1
+                  partial_events.append(name)
+
+                  print(
+                      f"Teilimport: {name}"
+                  )
+
+              else:
+
+                  status_update(
+                      event,
+                      "completed"
+                  )
+
+                  totals["events_completed"] += 1
+
+                  print(
+                      f"Veranstaltung abgeschlossen: {name}"
+                  )
+
               print(
-                  f"Veranstaltung abgeschlossen: {name}"
+                  f"Importierte Matches: {event_matches}"
               )
 
               print(
-                  f"Importierte Matches: "
-                  f"{totals['matches'] - matches_before}"
+                  f"Unklare Matches: {event_unclear}"
               )
 
               print(
-                  f"Unklare Matches: "
-                  f"{totals['unclear'] - unclear_before}"
+                  f"Fehlende Archive: {event_missing}"
               )
 
           print("=" * 60)
           print("DART LIONS PLAYER CENTER")
-          print("HISTORISCHER EINZELSPIELIMPORT")
+          print("AUTOMATISCHER EINZELSPIELIMPORT")
           print("=" * 60)
 
           log = request_json(
@@ -1129,15 +1407,194 @@ jobs:
 
           try:
 
-              for event_id in EVENT_IDS:
+              operator = request_json(
+                  BASE
+                  + "/eventoperator/"
+                  + OPERATOR_ID
+              )
 
-                  import_event(event_id)
+              if not isinstance(
+                  operator.get("allTournamentsClosed"),
+                  list
+              ):
+
+                  raise RuntimeError(
+                      "Veranstaltungsliste nicht verfügbar"
+                  )
+
+              closed_events = {
+                  e["id"]: e
+                  for e in operator["allTournamentsClosed"]
+                  if e.get("id")
+              }
+
+              events = sorted(
+                  closed_events.values(),
+                  key=lambda e: (
+                      event_date(
+                          e.get("beginnString")
+                      ) or "9999-12-31",
+                      e["id"]
+                  )
+              )
+
+              totals["events_found"] = len(events)
+
+              existing = get_existing_events()
+
+              print(
+                  "Abgeschlossene Veranstaltungen "
+                  f"gefunden: {len(events)}"
+              )
+
+              queue = []
+
+              for entry in events:
+
+                  event_id = entry["id"]
+
+                  old = existing.get(event_id)
+
+                  if old and old.get("import_status") in (
+                      "completed",
+                      "excluded"
+                  ):
+
+                      totals[
+                          "events_already_completed"
+                      ] += 1
+
+                      print(
+                          "Bereits verarbeitet: "
+                          f"{old['event_name']}"
+                      )
+
+                      continue
+
+                  queue.append(entry)
+
+              print(
+                  "Noch zu verarbeitende Veranstaltungen: "
+                  f"{len(queue)}"
+              )
+
+              for index, entry in enumerate(queue):
+
+                  if (
+                      time.monotonic() - START_TIME
+                      > MAX_RUNTIME
+                  ):
+
+                      totals["events_deferred"] = (
+                          len(queue) - index
+                      )
+
+                      print(
+                          "Zeitlimit erreicht. "
+                          "Rest bleibt für den nächsten Lauf."
+                      )
+
+                      break
+
+                  event_id = entry["id"]
+
+                  name = (
+                      entry.get("bezeichnung")
+                      or event_id
+                  )
+
+                  old = existing.get(event_id)
+
+                  attempts = (
+                      old.get("import_attempts", 0)
+                      if old else 0
+                  ) or 0
+
+                  event = upsert(
+                      "pc_events",
+                      {
+                          "darthelfer_event_id": event_id,
+                          "event_name": name,
+                          "event_type": get_event_type(
+                              name,
+                              entry.get("turniersystem")
+                          ),
+                          "event_date": event_date(
+                              entry.get("beginnString")
+                          ),
+                          "is_finished": True,
+                          "import_status": "running",
+                          "import_attempts": attempts + 1,
+                          "import_error": None,
+                          "import_completed_at": None,
+                          "synced_at": now()
+                      },
+                      "darthelfer_event_id"
+                  )[0]
+
+                  print("=" * 60)
+
+                  print(
+                      f"Veranstaltung {index + 1} "
+                      f"von {len(queue)}"
+                  )
+
+                  print(name)
+
+                  try:
+
+                      import_event(
+                          event_id,
+                          event
+                      )
+
+                  except Exception as error:
+
+                      if isinstance(
+                          error,
+                          urllib.error.HTTPError
+                      ):
+
+                          message = (
+                              f"HTTP {error.code}"
+                          )
+
+                      else:
+
+                          message = (
+                              f"{type(error).__name__}: "
+                              f"{str(error)[:300]}"
+                          )
+
+                      totals["events_failed"] += 1
+
+                      failed_events.append(
+                          (name, message)
+                      )
+
+                      print(
+                          f"Veranstaltungsfehler: {name}"
+                      )
+
+                      print(message)
+
+                      status_update(
+                          event,
+                          "failed",
+                          message
+                      )
+
+                      print(
+                          "Mit nächster Veranstaltung "
+                          "fortfahren."
+                      )
+
+                      time.sleep(2)
 
               incomplete = bool(
-                  totals["missing"]
-                  or totals["unclear"]
-                  or totals["skipped_events"]
-                  or not totals["matches"]
+                  totals["events_failed"]
+                  or totals["events_partial"]
+                  or totals["events_deferred"]
               )
 
               patch(
@@ -1150,13 +1607,17 @@ jobs:
                           if incomplete
                           else "success"
                       ),
-                      "events_imported": totals["events"],
+                      "events_imported": totals[
+                          "events_completed"
+                      ],
                       "matches_imported": totals["matches"],
                       "error_message": (
-                          f"Fehlende Archive: {totals['missing']}, "
-                          f"Unklare Matches: {totals['unclear']}, "
-                          f"Übersprungene Events: {totals['skipped_events']}, "
-                          f"Gründe: {dict(reasons)}"
+                          f"Fehlerhafte Events: "
+                          f"{totals['events_failed']}, "
+                          f"Teilimporte: "
+                          f"{totals['events_partial']}, "
+                          f"Ausstehend: "
+                          f"{totals['events_deferred']}"
                           if incomplete else None
                       )
                   }
@@ -1170,7 +1631,9 @@ jobs:
                   {
                       "finished_at": now(),
                       "status": "failed",
-                      "events_imported": totals["events"],
+                      "events_imported": totals[
+                          "events_completed"
+                      ],
                       "matches_imported": totals["matches"],
                       "error_message": type(error).__name__
                   }
@@ -1183,7 +1646,38 @@ jobs:
           print("=" * 60)
 
           print(
-              f"Veranstaltungen: {totals['events']}"
+              "Veranstaltungen gefunden: "
+              f"{totals['events_found']}"
+          )
+
+          print(
+              "Bereits verarbeitet: "
+              f"{totals['events_already_completed']}"
+          )
+
+          print(
+              "Neu abgeschlossen: "
+              f"{totals['events_completed']}"
+          )
+
+          print(
+              "Fehlerhafte Veranstaltungen: "
+              f"{totals['events_failed']}"
+          )
+
+          print(
+              "Teilimporte: "
+              f"{totals['events_partial']}"
+          )
+
+          print(
+              "Ausgeschlossene Veranstaltungen: "
+              f"{totals['events_excluded']}"
+          )
+
+          print(
+              "Noch ausstehend: "
+              f"{totals['events_deferred']}"
           )
 
           print(
@@ -1203,30 +1697,48 @@ jobs:
           )
 
           print(
-              f"Historische Matches ohne Endzeit: "
+              "Historische Matches ohne Endzeit: "
               f"{totals['historical']}"
           )
 
           print(
-              f"Doppel ausgeschlossen: {totals['doubles']}"
+              "Doppel ausgeschlossen: "
+              f"{totals['doubles']}"
           )
 
           print(
-              f"Doppelte Referenzen: {totals['duplicates']}"
+              "Doppelte Referenzen: "
+              f"{totals['duplicates']}"
           )
 
           print(
-              f"Fehlende Archive: {totals['missing']}"
+              "Fehlende Archive: "
+              f"{totals['missing']}"
           )
 
           print(
-              f"Unklare Matches: {totals['unclear']}"
+              "Unklare Matches: "
+              f"{totals['unclear']}"
           )
 
-          print(
-              f"Übersprungene Veranstaltungen: "
-              f"{totals['skipped_events']}"
-          )
+          if failed_events:
+
+              print("------------------------------")
+              print("FEHLERHAFTE VERANSTALTUNGEN")
+
+              for name, message in failed_events:
+
+                  print(
+                      f"{name} | {message}"
+                  )
+
+          if partial_events:
+
+              print("------------------------------")
+              print("TEILIMPORTE")
+
+              for name in partial_events:
+                  print(name)
 
           if reasons:
 
@@ -1235,15 +1747,11 @@ jobs:
 
               for reason, count in reasons.most_common():
 
-                  print(f"{reason}: {count}")
+                  print(
+                      f"{reason}: {count}"
+                  )
 
           print("=" * 60)
-
-          if not totals["matches"]:
-
-              raise RuntimeError(
-                  "Keine Einzelmatches importiert"
-              )
 
           print(
               "TEILIMPORT"
