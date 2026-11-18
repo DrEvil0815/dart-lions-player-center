@@ -34,7 +34,16 @@ jobs:
           BASE = "https://www.darthelfer.de/api/public"
 
           EVENT_IDS = [
-              "095a9171-9b93-491d-9fb0-f8c4c41509d7"
+                  "bc54838c-ee15-40b9-9d5b-47638392cdf7",
+                  "4699f4b9-2e6c-43ea-a49f-397e8e646989",
+                  "bd1fc951-1fa2-4e00-8906-cb9baf46e0e6",
+                  "b6d3f9bc-afca-4890-a959-a2a611b2d533",
+                  "6940279d-e477-4753-90b5-19b9b809a051",
+                  "896e1093-f1c4-48f0-a099-e01a7e740572",
+                  "abeffda9-c0e4-447d-b580-8ded2957384b",
+                  "f37a7a7a-d816-4c6d-b1ad-ce209bc06751",
+                  "69bf7f0a-e17d-438e-8a9d-ecc95683ea10",
+                  "066baa4e-8ba7-4c87-a91f-f6a1c3e79474"
           ]
 
           URL = (
