@@ -1,6 +1,11 @@
-name: Player Center - nuLiga Testimport
+name: Player Center - nuLiga Import
 on:
   workflow_dispatch:
+    inputs:
+      write_db:
+        description: 'Daten in Supabase speichern'
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -17,10 +22,16 @@ jobs:
           python-version: '3.12'
       - name: HTML Parser installieren
         run: python -m pip install beautifulsoup4==4.13.4
-      - name: Spielberichte lesend pruefen
+      - name: Spielberichte pruefen und optional speichern
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          WRITE_DB: ${{ inputs.write_db }}
         run: |
           python -u - <<'PYCODE'
-          import re, json, sys, time, traceback
+          import re, json, sys, time, traceback, os
+          from datetime import datetime, timezone
+          from urllib.parse import urlencode
           from urllib.parse import urljoin, urlparse, parse_qs
           from urllib.request import Request, urlopen
           from bs4 import BeautifulSoup
@@ -78,7 +89,7 @@ jobs:
                   kind='team' if label.lower()=='team' else 'doubles' if label.startswith('D') else 'singles'
                   pp=[players(c[1]),players(c[2])]
                   score_text=txt(c[3]); result_text=txt(c[-1])
-                  if not score_text and not result_text:
+                  if not score_text and not result_text and kind=='team':
                       print('Nicht gespielte Zeile:',label,'| Zellen:',[txt(x) for x in c])
                       continue
                   if not score_text or not result_text:
@@ -117,7 +128,7 @@ jobs:
                       c=row.find_all('td',recursive=False)
                       if len(c)<4: continue
                       highlights.append(dict(type=typ,count=int(txt(c[0])),value=int(txt(c[1])),players=players(c[2]),team=txt(c[-1]),section=label))
-              return dict(meeting=mid,group=group,date=date,home=home,away=away,side=side,legs=totals[0],result=totals[1],approved=any(txt(p)=='Spielbericht durch Spielleiter genehmigt.' for p in content.select('p')),matches=matches,highlights=highlights,averages=averages)
+              return dict(meeting=mid,group=group,date=date,competition=list(content.h1.stripped_strings)[1],event_time=re.search(r'(\d{2}:\d{2})\s*Uhr',heading).group(1),home=home,away=away,side=side,legs=totals[0],result=totals[1],approved=any(txt(p)=='Spielbericht durch Spielleiter genehmigt.' for p in content.select('p')),matches=matches,highlights=highlights,averages=averages)
           def show(d):
               print(f"{d['meeting']} | {d['date']} | {d['home']} - {d['away']} | {d['result']} | Legs {d['legs']} | Lions Seite {d['side']} | genehmigt {d['approved']}")
               print('Matches:',dict(Counter(m['type'] for m in d['matches'])), '| Highlights:',len(d['highlights']),'| Averages:',len(d['averages']))
@@ -134,11 +145,60 @@ jobs:
                   if not re.search(r'Dart\s+Lions\s+Gräfenberg',txt(row),re.I): continue
                   links[mid]=href
               return links
+
+          def save_reports(reports):
+              base=os.environ['SUPABASE_URL'].strip().rstrip('/').removesuffix('/rest/v1')+'/rest/v1/'
+              key=os.environ['SUPABASE_SERVICE_ROLE_KEY'].strip()
+              if not key or not base.startswith('https://'): raise RuntimeError('Supabase-Zugangsdaten fehlen')
+              headers={'apikey':key,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=representation'}
+              if not key.startswith('sb_secret_'): headers['Authorization']='Bearer '+key
+              def api(table,method='GET',query=None,body=None):
+                  url=base+table+('?' + urlencode(query) if query else '')
+                  req=Request(url,data=json.dumps(body,ensure_ascii=False).encode() if body is not None else None,headers=headers,method=method)
+                  try:
+                      with urlopen(req,timeout=60) as r: return json.loads(r.read())
+                  except Exception as e:
+                      raise RuntimeError(f'Supabase {table}: {type(e).__name__} {getattr(e,"code", "")}') from None
+              def put(table,rows,conflict):
+                  if not rows: return []
+                  return api(table,'POST',{'on_conflict':conflict},rows)
+              counts=Counter()
+              stamp=datetime.now(timezone.utc).isoformat()
+              for d,href in reports:
+                  mid=d['meeting']; side=d['side']; home=d['home']; away=d['away']
+                  event=dict(nuliga_match_id=mid,nuliga_group_id=d['group'],season='2026/27',competition_name=d['competition'],competition_type='cup' if d['group']=='211398' else 'league',event_date=datetime.strptime(d['date'],'%d.%m.%Y').date().isoformat(),event_time=d['event_time'],home_team=home,away_team=away,lions_team=home if side==1 else away,is_home_match=side==1,home_score=d['result'][0],away_score=d['result'][1],home_legs=d['legs'][0],away_legs=d['legs'][1],is_finished=True,is_approved=d['approved'],report_url=href,report_status='approved' if d['approved'] else 'provisional',raw_data=d,synced_at=stamp)
+                  # Stable keys. Do not overwrite reconciliation columns or existing IDs.
+                  eid=put('pc_nuliga_events',[event],'nuliga_match_id')[0]['id']
+                  ms=[]
+                  for n,m in enumerate(d['matches'],1):
+                      a,b=m['legs']; x,y=m['result']
+                      ms.append(dict(event_id=eid,match_number=n,match_type=m['type'],home_legs=a,away_legs=b,winner_side=1 if x>y else 2 if y>x else None,is_finished=True,raw_data=m,synced_at=stamp))
+                  saved=put('pc_nuliga_matches',ms,'event_id,match_number'); ids={r['match_number']:r['id'] for r in saved}
+                  ps=[]
+                  for n,m in enumerate(d['matches'],1):
+                      if m['type']=='team': continue
+                      for i,group in enumerate(m['players']):
+                          for j,p in enumerate(group):
+                              ps.append(dict(match_id=ids[n],nuliga_person_id=p['person'],player_name=p['name'],player_side=i+1,player_position=j+1,is_home_player=i==0,won=m['result'][i]>m['result'][1-i],legs_won=m['legs'][i],legs_lost=m['legs'][1-i],raw_data=p,synced_at=stamp))
+                  av=[dict(event_id=eid,nuliga_person_id=a['player']['person'],source_key=str(a['side'])+':'+a['player']['person'],player_name=a['player']['name'],player_side=a['side'],average=a['average'],average_type='matchday',raw_data=a,synced_at=stamp) for a in d['averages']]
+                  hs={}
+                  for h in d['highlights']:
+                      pp=h['players']; single=len(pp)==1 and bool(pp[0]['person']); hs_side=1 if h['team']==home else 2 if h['team']==away else None
+                      identity=','.join(sorted(p['person'] or p['name'] for p in pp)) or h['team']
+                      sk=f"{h['type']}:{h['value']}:{hs_side}:{identity}"
+                      if sk in hs: hs[sk]['highlight_count']+=h['count']; continue
+                      hs[sk]=dict(event_id=eid,nuliga_person_id=pp[0]['person'] if single else None,player_name=' / '.join(p['name'] for p in pp) or None,team_name=h['team'],player_side=hs_side,highlight_type=h['type'],highlight_value=h['value'],highlight_count=h['count'],match_type='unknown',attribution='player' if single else 'team' if len(pp)>1 else 'unknown',source_key=sk,raw_data=h,synced_at=stamp)
+                  for table,rows,conflict in [('pc_nuliga_players',ps,'match_id,player_side,player_position'),('pc_nuliga_averages',av,'event_id,source_key,average_type'),('pc_nuliga_highlights',list(hs.values()),'event_id,source_key')]:
+                      put(table,rows,conflict); counts[table]+=len(rows)
+                  counts['pc_nuliga_events']+=1; counts['pc_nuliga_matches']+=len(ms)
+                  print('GESPEICHERT:',mid,'genehmigt:',d['approved'],flush=True)
+              print('DATENBANK GESAMT:',json.dumps(dict(counts)))
+
           if __name__=='__main__':
               if len(sys.argv)>1:
                   for path in sys.argv[1:]: show(parse(BeautifulSoup(open(path,encoding='utf-8').read(),'html.parser')))
               else:
-                  failures=0; tested=set(); aggregate=Counter(); found=set()
+                  failures=0; tested=set(); aggregate=Counter(); found=set(); reports=[]
                   for group,team in GROUPS.items():
                       champ='Oberfranken+Pokal+26%2F27' if group=='211398' else 'OFr+2026%2F27'
                       url=WA+'groupPage?championship='+champ+'&group='+group+'&displayDetail=meetings&displayTyp=gesamt'
@@ -157,6 +217,7 @@ jobs:
                               d=parse(fetch(href))
                               if d['meeting']!=mid or d['group']!=group: raise ValueError('Falscher Spielbericht')
                               show(d)
+                              reports.append((d,href))
                               if not d['approved']:
                                   aggregate['nicht_genehmigt']+=1
                                   print('Noch nicht genehmigt - separat gezaehlt')
@@ -177,6 +238,7 @@ jobs:
                   print('Fehlende Referenzberichte:',sorted(missing))
                   print('GESAMT:',json.dumps(dict(aggregate),ensure_ascii=False))
                   print('Gefundene Berichte:',len(found),'| Fehler:',failures)
-                  print('Nur Lesemodus - keine Datenbankzugriffe')
                   if failures: sys.exit(1)
+                  if os.environ.get('WRITE_DB')=='true': save_reports(reports)
+                  else: print('Nur Lesemodus - keine Datenbankzugriffe')
           PYCODE
