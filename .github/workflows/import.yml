@@ -1896,11 +1896,19 @@ jobs:
                       raise ValueError("Doppel: unklare Aufnahmegruppen")
                   score_groups[gid] = group.get("scores") or []
               prepared = []
+              archive_ids = [archive.get(f"player{i}Id") for i in (1, 2)]
+              team_ids = [team["darthelfer_player_id"] for _, team in team_rows]
+              if len(team_ids) != 2 or not all(archive_ids) or len(set(archive_ids)) != 2 or set(archive_ids) != set(team_ids):
+                  raise ValueError("Doppel: Team-IDs widersprechen sich")
               for side, team in team_rows:
-                  stat = archive.get(f"player{side}Statistik") or {}
-                  details = archive.get(f"gameDetailsPlayer{side}") or []
                   pid = team["darthelfer_player_id"]
-                  if archive.get(f"player{side}Id") != pid or stat.get("playerid") != pid or not details:
+                  archive_sides = [i for i in (1, 2) if archive.get(f"player{i}Id") == pid]
+                  if len(archive_sides) != 1:
+                      raise ValueError("Doppel: Team-Archivzuordnung unklar")
+                  archive_side = archive_sides[0]
+                  stat = archive.get(f"player{archive_side}Statistik") or {}
+                  details = archive.get(f"gameDetailsPlayer{archive_side}") or []
+                  if stat.get("playerid") != pid or not details:
                       raise ValueError("Doppel: Team-Archivzuordnung unklar")
                   if stat.get("gewonneneLegs") != team["legs_won"] or stat.get("verloreneLegs") != team["legs_lost"]:
                       raise ValueError("Doppel: Archiv und Ergebnis widersprechen sich")
@@ -1993,6 +2001,15 @@ jobs:
                           highlights.append(highlight("short_leg", d["wuerfe"], "double_short_leg:" + leg["id"], d))
               # Same keys as historical backfill; ignore existing confirmed attributions.
               insert_new_highlights(highlights)
+              for h in highlights:
+                  existing = db_get("pc_highlights", {
+                      "select": "id,player_side,player_name,attribution,verification_status",
+                      "source": "eq.darthelfer", "source_key": "eq." + h["source_key"],
+                      "match_id": "eq." + match["id"]
+                  }) or []
+                  for old in existing:
+                      if old["attribution"] == "team" and old["verification_status"] == "confirmed" and (old["player_side"] != h["player_side"] or old["player_name"] != h["player_name"]):
+                          patch("pc_highlights", old["id"], {"player_side": h["player_side"], "player_name": h["player_name"], "updated_at": now()})
               print(f"DOPPEL-DETAILS: {match['darthelfer_match_id']} | 2 Teams, {leg_count} Team-Legs, {visit_count} Aufnahmen, {len(highlights)} Highlight-Kandidaten")
 
 
