@@ -1,4 +1,3 @@
-
 name: Player Center - nuLiga Spielerkarrieren
 
 on:
@@ -11,21 +10,17 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Python vorbereiten
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
       - name: HTML Parser installieren
         run: python -m pip install beautifulsoup4==4.13.4
-
       - name: Spielerkarrieren ermitteln
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
         run: |
           python -u - <<'PY'
           import os
@@ -138,7 +133,7 @@ jobs:
                   url,
                   headers={
                       "User-Agent":
-                          "Dart Lions Player Center/2.2",
+                          "Dart Lions Player Center/2.3",
                       "Accept": "text/html"
                   }
               )
@@ -240,7 +235,12 @@ jobs:
               }
 
 
-          def find_row(content, label):
+          def find_row(content, *labels):
+
+              def normalize(value):
+                  return " ".join(value.split()).strip(":").casefold()
+
+              labels = {normalize(label) for label in labels}
 
               for row in content.select("tr"):
 
@@ -251,7 +251,7 @@ jobs:
 
                   if (
                       len(cells) >= 2
-                      and txt(cells[0]).strip(":") == label
+                      and normalize(txt(cells[0])) in labels
                   ):
                       return row
 
@@ -273,12 +273,12 @@ jobs:
 
               season_row = find_row(
                   content,
-                  "Saisonen"
+                  "Saisonen", "Saisons", "Seasons"
               )
 
               club_row = find_row(
                   content,
-                  "Verein"
+                  "Verein", "Club"
               )
 
               if season_row is None:
@@ -336,10 +336,13 @@ jobs:
 
                   heading = txt(element)
 
-                  if "Spielsaison" in heading:
+                  if any(word in heading.casefold() for word in ("spielsaison", "season")):
 
                       current_heading = heading
                       break
+
+              if not current_heading:
+                  raise RuntimeError("Spielerportrait-Ueberschrift fehlt; Zugriff oder HTML pruefen")
 
               info = season_info(
                   current.get("season", ""),
@@ -407,12 +410,12 @@ jobs:
 
               team_row = find_row(
                   content,
-                  "Mannschaftsaufstellung"
+                  "Mannschaftsaufstellung", "Team Line-up", "Team lineup"
               )
 
               assignments_row = find_row(
                   content,
-                  "Mannschaftseinsätze"
+                  "Mannschaftseinsätze", "Team appearances"
               )
 
               item = {
@@ -445,6 +448,7 @@ jobs:
                   ),
 
                   "report_count": len(reports),
+                  "report_availability": "links_found" if reports else "no_links_not_verified",
 
                   "meeting_ids":
                       sorted(reports.keys()),
@@ -462,7 +466,7 @@ jobs:
 
           print("=" * 60)
           print("DART LIONS PLAYER CENTER")
-          print("HISTORISCHE SPIELERKARRIEREN V1.0")
+          print("HISTORISCHE SPIELERKARRIEREN V1.1")
           print("=" * 60)
 
 
@@ -591,12 +595,7 @@ jobs:
 
               print("=" * 60)
 
-              print(
-                  member["member_number"],
-                  name,
-                  "| Personen-ID:",
-                  person_id
-              )
+              print("Pruefe naechstes zugeordnetes Mitglied")
 
               start_url = (
                   BASE +
@@ -682,13 +681,7 @@ jobs:
                           member_careers.append(item)
                           all_careers.append(item)
 
-                          print(
-                              json.dumps(
-                                  item,
-                                  ensure_ascii=False,
-                                  indent=2
-                              )
-                          )
+                          print("Saison:", item["season"], "|", item["competition_type"], "| Fremdverein:", not item["is_dart_lions"], "| Berichtslinks:", item["report_count"])
 
                       for meeting_id, report in reports.items():
 
@@ -745,7 +738,7 @@ jobs:
                       print(
                           "WARNUNG:",
                           type(exc).__name__,
-                          str(exc)
+                          str(exc) if isinstance(exc, RuntimeError) else "Abruffehler"
                       )
 
               if member_careers and not member_failed:
@@ -758,38 +751,11 @@ jobs:
           print("=" * 60)
 
 
-          for item in all_careers:
-
-              if item["is_dart_lions"]:
-                  continue
-
-              print(
-                  item["member_name"],
-                  "|",
-                  item["season"],
-                  "|",
-                  item["club_name"],
-                  "|",
-                  item["competition_type"],
-                  "| Spielberichte:",
-                  item["report_count"]
-              )
-
-
-          print("=" * 60)
-          print("FRÜHERE VEREINE")
-          print("=" * 60)
-
-
-          for club_id, club_name in sorted(
-              historical_clubs.items()
-          ):
-
-              print(
-                  club_id,
-                  "|",
-                  club_name
-              )
+          for season in sorted({x["season"] for x in all_careers}):
+              for kind in ("league", "cup"):
+                  items = [x for x in all_careers if not x["is_dart_lions"] and x["season"] == season and x["competition_type"] == kind]
+                  if items:
+                      print(season, kind, "| Karriereabschnitte:", len(items), "| Ohne Berichtslinks (ungeprueft):", sum(not x["report_count"] for x in items))
 
 
           print("=" * 60)
@@ -810,20 +776,8 @@ jobs:
           print("=" * 60)
 
 
-          for meeting_id in sorted(
-              historical_reports
-          ):
-
-              report = all_reports[meeting_id]
-
-              print(
-                  "Meeting:",
-                  meeting_id,
-                  "| Zugeordnete Personen:",
-                  len(report["person_ids"]),
-                  "|",
-                  report["report_url"]
-              )
+          print("Bekannter historischer Testbericht 6099260 gefunden:", "ja" if "6099260" in historical_reports else "nein")
+          print("Historische Abschnitte ohne Berichtslinks (Verfuegbarkeit offen):", sum(not x["is_dart_lions"] and not x["report_count"] for x in all_careers))
 
 
           print("=" * 60)
@@ -883,15 +837,11 @@ jobs:
               print("OFFENE PRÜFUNGEN")
               print("=" * 60)
 
-              for failure in failures:
-
-                  print(
-                      json.dumps(
-                          failure,
-                          ensure_ascii=False,
-                          indent=2
-                      )
-                  )
+              from collections import Counter
+              for reason, count in Counter(f["error"] for f in failures).items():
+                  # Nur bekannte Parserfehler ausgeben; externe Fehler koennen URLs enthalten.
+                  safe = reason if reason in {"Saisonübersicht fehlt", "Vereinsübersicht fehlt", "Verein nicht eindeutig erkannt", "Vereins-ID stimmt nicht überein", "Falsche Personen-ID", "Spielzeit nicht erkannt", "Ungültige Spielzeit", "Sicherheitslimit erreicht", "Spielerportrait-Ueberschrift fehlt; Zugriff oder HTML pruefen", "Seiteninhalt fehlt"} else "Sonstiger Abruf- oder Parserfehler"
+                  print(count, safe)
 
               raise RuntimeError(
                   "Karriereerkennung noch unvollständig"
@@ -906,7 +856,10 @@ jobs:
 
 
           print("=" * 60)
-          print("KARRIEREERKENNUNG ERFOLGREICH")
+          if "6099260" not in historical_reports:
+              raise RuntimeError("Bekannter historischer Testbericht fehlt; Zugriff oder Parser pruefen")
+
+          print("KARRIEREERKENNUNG ERFOLGREICH (nur verlinkte Daten)")
           print("KEINE DATENBANKÄNDERUNGEN")
           print("GAME ON!")
           PY
