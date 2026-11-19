@@ -1,0 +1,964 @@
+name: Player Center - nuLiga Historische Spielberichte
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Python vorbereiten
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: HTML Parser installieren
+        run: python -m pip install beautifulsoup4==4.13.4
+      - name: Historische Spielberichte untersuchen
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python -u - <<'PY'
+          import os
+          import re
+          import json
+          import time
+
+          from collections import deque
+          from urllib.request import Request, urlopen
+          from urllib.parse import (
+              urlencode,
+              urljoin,
+              urlparse,
+              parse_qs
+          )
+          from bs4 import BeautifulSoup
+
+
+          HOST = "bdv-dart.liga.nu"
+
+          BASE = (
+              "https://" + HOST +
+              "/cgi-bin/WebObjects/"
+              "nuLigaDARTDE.woa/wa/"
+          )
+
+          CLUB = "6042"
+          START_SEASON = "2026/27"
+
+          SUPABASE_URL = os.environ[
+              "SUPABASE_URL"
+          ].strip().rstrip("/")
+
+          SUPABASE_KEY = os.environ[
+              "SUPABASE_SERVICE_ROLE_KEY"
+          ].strip()
+
+          if SUPABASE_URL.endswith("/rest/v1"):
+              SUPABASE_URL = SUPABASE_URL[:-8]
+
+          REST = SUPABASE_URL + "/rest/v1/"
+
+
+          def txt(element):
+              return " ".join(element.stripped_strings)
+
+
+          def database_rows(table, parameters):
+
+              rows = []
+              offset = 0
+              limit = 500
+
+              while True:
+
+                  query = dict(parameters)
+
+                  query["limit"] = limit
+                  query["offset"] = offset
+
+                  url = (
+                      REST + table + "?" +
+                      urlencode(query)
+                  )
+
+                  request = Request(
+                      url,
+                      headers={
+                          "apikey": SUPABASE_KEY,
+                          "Authorization":
+                              "Bearer " + SUPABASE_KEY,
+                          "Accept": "application/json"
+                      }
+                  )
+
+                  with urlopen(
+                      request,
+                      timeout=45
+                  ) as response:
+
+                      part = json.loads(
+                          response.read()
+                      )
+
+                  if not isinstance(part, list):
+                      raise RuntimeError(
+                          "Unerwartete Datenbankantwort"
+                      )
+
+                  rows.extend(part)
+
+                  if len(part) < limit:
+                      break
+
+                  offset += len(part)
+
+              return rows
+
+
+          def fetch(url):
+
+              if urlparse(url).hostname != HOST:
+                  raise RuntimeError(
+                      "Unbekannter Host"
+                  )
+
+              time.sleep(1)
+
+              request = Request(
+                  url,
+                  headers={
+                      "User-Agent":
+                          "Dart Lions Player Center/2.3",
+                      "Accept": "text/html"
+                  }
+              )
+
+              with urlopen(
+                  request,
+                  timeout=45
+              ) as response:
+
+                  final_url = response.geturl()
+
+                  if urlparse(final_url).hostname != HOST:
+                      raise RuntimeError(
+                          "Unbekanntes Weiterleitungsziel"
+                      )
+
+                  soup = BeautifulSoup(
+                      response.read(),
+                      "html.parser"
+                  )
+
+              content = soup.select_one("#content")
+
+              if content is None:
+                  raise RuntimeError(
+                      "Seiteninhalt fehlt"
+                  )
+
+              return content, final_url
+
+
+          def parameters(url):
+
+              return {
+                  key: values[0]
+
+                  for key, values in parse_qs(
+                      urlparse(url).query
+                  ).items()
+
+                  if len(values) == 1
+              }
+
+
+          def portrait_key(url):
+
+              p = parameters(url)
+
+              return (
+                  p.get("federation", "BDV"),
+                  p.get("person", ""),
+                  p.get("season", ""),
+                  p.get("club", ""),
+                  p.get("mode", "")
+              )
+
+
+          def season_info(value, heading=""):
+
+              combined = value + " " + heading
+
+              match = re.search(
+                  r"(\d{4}|\d{2})/(\d{2,4})",
+                  combined
+              )
+
+              if not match:
+                  raise RuntimeError(
+                      "Spielzeit nicht erkannt"
+                  )
+
+              start = int(match.group(1))
+
+              if start < 100:
+                  start += 2000
+
+              end = int(match.group(2))
+
+              if end < 100:
+                  end += (start // 100) * 100
+
+                  if end < start:
+                      end += 100
+
+              if end != start + 1:
+                  raise RuntimeError(
+                      "Ungültige Spielzeit"
+                  )
+
+              return {
+                  "season":
+                      f"{start}/{end % 100:02d}",
+
+                  "competition_type": (
+                      "cup"
+                      if "pokal" in combined.lower()
+                      else "league"
+                  )
+              }
+
+
+          def find_row(content, *labels):
+
+              def normalize(value):
+                  return " ".join(value.split()).strip(":").casefold()
+
+              labels = {normalize(label) for label in labels}
+
+              for row in content.select("tr"):
+
+                  cells = row.find_all(
+                      ["td", "th"],
+                      recursive=False
+                  )
+
+                  if (
+                      len(cells) >= 2
+                      and normalize(txt(cells[0])) in labels
+                  ):
+                      return row
+
+              return None
+
+
+          def discover_portrait(
+              content,
+              page_url,
+              person_id
+          ):
+
+              current = parameters(page_url)
+
+              if current.get("person") != person_id:
+                  raise RuntimeError(
+                      "Falsche Personen-ID"
+                  )
+
+              season_row = find_row(
+                  content,
+                  "Saisonen", "Saisons", "Seasons"
+              )
+
+              club_row = find_row(
+                  content,
+                  "Verein", "Club"
+              )
+
+              if season_row is None:
+                  raise RuntimeError(
+                      "Saisonübersicht fehlt"
+                  )
+
+              if club_row is None:
+                  raise RuntimeError(
+                      "Vereinsübersicht fehlt"
+                  )
+
+              club_links = club_row.select(
+                  'a[href*="clubInfoDisplay"]'
+              )
+
+              clubs = {}
+
+              for link in club_links:
+
+                  href = urljoin(
+                      page_url,
+                      link["href"]
+                  )
+
+                  if urlparse(href).hostname != HOST:
+                      continue
+
+                  club_id = parameters(href).get(
+                      "club"
+                  )
+
+                  if club_id:
+                      clubs[club_id] = txt(link)
+
+              if len(clubs) != 1:
+                  raise RuntimeError(
+                      "Verein nicht eindeutig erkannt"
+                  )
+
+              club_id, club_name = next(
+                  iter(clubs.items())
+              )
+
+              if current.get("club") != club_id:
+                  raise RuntimeError(
+                      "Vereins-ID stimmt nicht überein"
+                  )
+
+              current_heading = ""
+
+              for element in content.select(
+                  "h1, h2, h3"
+              ):
+
+                  heading = txt(element)
+
+                  if any(word in heading.casefold() for word in ("spielsaison", "season")):
+
+                      current_heading = heading
+                      break
+
+              if not current_heading:
+                  raise RuntimeError("Spielerportrait-Ueberschrift fehlt; Zugriff oder HTML pruefen")
+
+              info = season_info(
+                  current.get("season", ""),
+                  current_heading
+              )
+
+              season_links = {}
+
+              for link in season_row.select(
+                  'a[href*="playerPortrait"]'
+              ):
+
+                  href = urljoin(
+                      page_url,
+                      link["href"]
+                  )
+
+                  if urlparse(href).hostname != HOST:
+                      continue
+
+                  p = parameters(href)
+
+                  if p.get("person") != person_id:
+                      continue
+
+                  if not p.get("season"):
+                      continue
+
+                  season_links[
+                      portrait_key(href)
+                  ] = href
+
+              reports = {}
+
+              for link in content.select(
+                  'a[href*="groupMeetingReport"]'
+              ):
+
+                  href = urljoin(
+                      page_url,
+                      link["href"]
+                  )
+
+                  if urlparse(href).hostname != HOST:
+                      continue
+
+                  p = parameters(href)
+
+                  meeting_id = p.get("meeting")
+
+                  if not meeting_id:
+                      continue
+
+                  if not meeting_id.isdigit():
+                      continue
+
+                  reports[meeting_id] = {
+                      "meeting_id": meeting_id,
+                      "championship": p.get(
+                          "championship"
+                      ),
+                      "group_id": p.get("group"),
+                      "report_url": href
+                  }
+
+              team_row = find_row(
+                  content,
+                  "Mannschaftsaufstellung", "Team Line-up", "Team lineup"
+              )
+
+              assignments_row = find_row(
+                  content,
+                  "Mannschaftseinsätze", "Team appearances"
+              )
+
+              item = {
+
+                  "person_id": person_id,
+
+                  "season": info["season"],
+
+                  "source_season":
+                      current.get("season"),
+
+                  "competition_type":
+                      info["competition_type"],
+
+                  "club_id": club_id,
+
+                  "club_name": club_name,
+
+                  "is_dart_lions":
+                      club_id == CLUB,
+
+                  "team_assignment": (
+                      txt(team_row)
+                      if team_row else None
+                  ),
+
+                  "team_appearances": (
+                      txt(assignments_row)
+                      if assignments_row else None
+                  ),
+
+                  "report_count": len(reports),
+                  "report_availability": "links_found" if reports else "no_links_not_verified",
+
+                  "meeting_ids":
+                      sorted(reports.keys()),
+
+                  "portrait_url": page_url
+
+              }
+
+              return (
+                  item,
+                  season_links,
+                  reports
+              )
+
+
+          print("=" * 60)
+          print("DART LIONS PLAYER CENTER")
+          print("HISTORISCHE SPIELERKARRIEREN V1.1")
+          print("=" * 60)
+
+
+          members = database_rows(
+              "pc_members",
+              {
+                  "select":
+                      "id,member_number,"
+                      "first_name,last_name,is_active",
+
+                  "order": "member_number.asc"
+              }
+          )
+
+
+          identities = database_rows(
+              "pc_player_ids",
+              {
+                  "select":
+                      "member_id,darthelfer_player_id",
+
+                  "darthelfer_player_id":
+                      "like.nuliga_person:*",
+
+                  "order":
+                      "darthelfer_player_id.asc"
+              }
+          )
+
+
+          member_ids = {
+              member["id"]
+              for member in members
+          }
+
+          person_mapping = {}
+          person_owners = {}
+
+
+          for identity in identities:
+
+              member_id = identity["member_id"]
+
+              person_id = identity[
+                  "darthelfer_player_id"
+              ].split(":", 1)[1]
+
+              if member_id not in member_ids:
+                  raise RuntimeError(
+                      "Unbekanntes Mitglied"
+                  )
+
+              if not person_id.isdigit():
+                  raise RuntimeError(
+                      "Ungültige Personen-ID"
+                  )
+
+              person_mapping.setdefault(
+                  member_id,
+                  set()
+              ).add(person_id)
+
+              person_owners.setdefault(
+                  person_id,
+                  set()
+              ).add(member_id)
+
+
+          if any(
+              len(ids) != 1
+              for ids in person_mapping.values()
+          ):
+              raise RuntimeError(
+                  "Mehrdeutige Mitgliederzuordnung"
+              )
+
+          if any(
+              len(ids) != 1
+              for ids in person_owners.values()
+          ):
+              raise RuntimeError(
+                  "Personen-ID mehrfach zugeordnet"
+              )
+
+
+          print(
+              "Mitglieder insgesamt:",
+              len(members)
+          )
+
+          print(
+              "Mitglieder mit nuLiga-ID:",
+              len(person_mapping)
+          )
+
+          print(
+              "Mitglieder ohne nuLiga-ID:",
+              len(members) - len(person_mapping)
+          )
+
+
+          all_careers = []
+          all_reports = {}
+          historical_reports = set()
+          historical_members = set()
+          historical_clubs = {}
+          failures = []
+          verified_members = set()
+
+
+          for member in members:
+
+              member_id = member["id"]
+
+              if member_id not in person_mapping:
+                  continue
+
+              person_id = next(
+                  iter(person_mapping[member_id])
+              )
+
+              name = (
+                  member["first_name"] + " " +
+                  member["last_name"]
+              )
+
+              print("=" * 60)
+
+              print("Pruefe naechstes zugeordnetes Mitglied")
+
+              start_url = (
+                  BASE +
+                  "playerPortrait?" +
+                  urlencode({
+                      "federation": "BDV",
+                      "season": START_SEASON,
+                      "person": person_id,
+                      "club": CLUB
+                  })
+              )
+
+              queue = deque([start_url])
+              visited = set()
+              member_careers = []
+              member_failed = False
+
+
+              while queue:
+
+                  url = queue.popleft()
+
+                  key = portrait_key(url)
+
+                  if key in visited:
+                      continue
+
+                  if len(visited) >= 40:
+
+                      failures.append({
+                          "member_number":
+                              member["member_number"],
+                          "person_id": person_id,
+                          "error":
+                              "Sicherheitslimit erreicht"
+                      })
+
+                      member_failed = True
+                      break
+
+                  visited.add(key)
+
+                  try:
+
+                      content, final_url = fetch(url)
+
+                      (
+                          item,
+                          links,
+                          reports
+                      ) = discover_portrait(
+                          content,
+                          final_url,
+                          person_id
+                      )
+
+                      item["member_number"] = (
+                          member["member_number"]
+                      )
+
+                      item["member_name"] = name
+
+                      item_key = (
+                          item["season"],
+                          item["competition_type"],
+                          item["club_id"],
+                          item["source_season"]
+                      )
+
+                      known_keys = {
+                          (
+                              x["season"],
+                              x["competition_type"],
+                              x["club_id"],
+                              x["source_season"]
+                          )
+
+                          for x in member_careers
+                      }
+
+                      if item_key not in known_keys:
+
+                          member_careers.append(item)
+                          all_careers.append(item)
+
+                          print("Saison:", item["season"], "|", item["competition_type"], "| Fremdverein:", not item["is_dart_lions"], "| Berichtslinks:", item["report_count"])
+
+                      for meeting_id, report in reports.items():
+
+                          record = all_reports.setdefault(
+                              meeting_id,
+                              {
+                                  **report,
+                                  "person_ids": set(),
+                                  "club_ids": set()
+                              }
+                          )
+
+                          record["person_ids"].add(
+                              person_id
+                          )
+
+                          record["club_ids"].add(
+                              item["club_id"]
+                          )
+
+                          if not item["is_dart_lions"]:
+
+                              historical_reports.add(
+                                  meeting_id
+                              )
+
+                      if not item["is_dart_lions"]:
+
+                          historical_members.add(
+                              member_id
+                          )
+
+                          historical_clubs[
+                              item["club_id"]
+                          ] = item["club_name"]
+
+                      for link_key, href in links.items():
+
+                          if link_key not in visited:
+                              queue.append(href)
+
+                  except Exception as exc:
+
+                      member_failed = True
+
+                      failures.append({
+                          "member_number":
+                              member["member_number"],
+                          "person_id": person_id,
+                          "portrait_url": url,
+                          "error": str(exc)
+                      })
+
+                      print(
+                          "WARNUNG:",
+                          type(exc).__name__,
+                          str(exc) if isinstance(exc, RuntimeError) else "Abruffehler"
+                      )
+
+              if member_careers and not member_failed:
+
+                  verified_members.add(member_id)
+
+
+          print("=" * 60)
+          print("FRÜHERE VEREINSKARRIEREN")
+          print("=" * 60)
+
+
+          for season in sorted({x["season"] for x in all_careers}):
+              for kind in ("league", "cup"):
+                  items = [x for x in all_careers if not x["is_dart_lions"] and x["season"] == season and x["competition_type"] == kind]
+                  if items:
+                      print(season, kind, "| Karriereabschnitte:", len(items), "| Ohne Berichtslinks (ungeprueft):", sum(not x["report_count"] for x in items))
+
+
+          print("=" * 60)
+          print("SPIELZEITEN")
+          print("=" * 60)
+
+
+          for season in sorted({
+              x["season"]
+              for x in all_careers
+          }):
+
+              print(season)
+
+
+          print("=" * 60)
+          print("EINDEUTIGE SPIELBERICHTE")
+          print("=" * 60)
+
+
+          print("Bekannter historischer Testbericht 6099260 gefunden:", "ja" if "6099260" in historical_reports else "nein")
+          print("Historische Abschnitte ohne Berichtslinks (Verfuegbarkeit offen):", sum(not x["is_dart_lions"] and not x["report_count"] for x in all_careers))
+
+
+          print("=" * 60)
+          print("ZUSAMMENFASSUNG")
+          print("=" * 60)
+
+
+          print(
+              "Mitglieder insgesamt:",
+              len(members)
+          )
+
+          print(
+              "Mitglieder mit nuLiga-ID:",
+              len(person_mapping)
+          )
+
+          print(
+              "Vollständig überprüfte Mitglieder:",
+              len(verified_members)
+          )
+
+          print(
+              "Mitglieder mit früheren Vereinen:",
+              len(historical_members)
+          )
+
+          print(
+              "Erkannte frühere Vereine:",
+              len(historical_clubs)
+          )
+
+          print(
+              "Erkannte Karriereabschnitte:",
+              len(all_careers)
+          )
+
+          print(
+              "Eindeutige Spielberichte insgesamt:",
+              len(all_reports)
+          )
+
+          print(
+              "Spielberichte früherer Vereine:",
+              len(historical_reports)
+          )
+
+          print(
+              "Fehler und offene Zuordnungen:",
+              len(failures)
+          )
+
+
+          if failures:
+
+              print("=" * 60)
+              print("OFFENE PRÜFUNGEN")
+              print("=" * 60)
+
+              from collections import Counter
+              for reason, count in Counter(f["error"] for f in failures).items():
+                  # Nur bekannte Parserfehler ausgeben; externe Fehler koennen URLs enthalten.
+                  safe = reason if reason in {"Saisonübersicht fehlt", "Vereinsübersicht fehlt", "Verein nicht eindeutig erkannt", "Vereins-ID stimmt nicht überein", "Falsche Personen-ID", "Spielzeit nicht erkannt", "Ungültige Spielzeit", "Sicherheitslimit erreicht", "Spielerportrait-Ueberschrift fehlt; Zugriff oder HTML pruefen", "Seiteninhalt fehlt"} else "Sonstiger Abruf- oder Parserfehler"
+                  print(count, safe)
+
+              raise RuntimeError(
+                  "Karriereerkennung noch unvollständig"
+              )
+
+
+          if len(verified_members) != len(person_mapping):
+
+              raise RuntimeError(
+                  "Nicht alle Mitglieder überprüft"
+              )
+
+
+          print("=" * 60)
+          if "6099260" not in historical_reports:
+              raise RuntimeError("Bekannter historischer Testbericht fehlt; Zugriff oder Parser pruefen")
+
+
+          # Read-only structural diagnosis; no personal data in public logs.
+          from collections import Counter
+          from urllib.error import HTTPError
+
+          def norm(s):
+              return " ".join(s.split()).casefold()
+
+          def category(s):
+              t = norm(s)
+              if "180" in t: return "180"
+              if any(x in t for x in ("high finish", "highfinish", "high checkout")): return "highfinish"
+              if any(x in t for x in ("low dart", "short leg", "shortleg")): return "short_leg"
+              if any(x in t for x in ("average", "avg", "durchschnitt")): return "average"
+              if any(x in t for x in ("einzel", "single")): return "singles"
+              if any(x in t for x in ("doppel", "double")): return "doubles"
+              if any(x in t for x in ("teamgame", "team game", "teamspiel")): return "team"
+              return "other"
+
+          def safe_header(cell):
+              t = norm(txt(cell))
+              known = {"nr", "nr.", "no", "no.", "spieler", "player", "heim", "gast", "home", "away", "legs", "sets", "sätze", "spiele", "matches", "ergebnis", "result", "punkte", "points", "anzahl", "count", "wert", "value", "average", "avg", "3-dart-average", "180er", "high finishes", "low darts", "darts", "datum", "date", "name", "mannschaft", "team", "satz", "set"}
+              return t if t in known else "[other]"
+
+          formats = Counter()
+          errors = Counter()
+          readable = 0
+          matched_members = set()
+          no_member_links = 0
+          print("=" * 60)
+          print("HISTORISCHE BERICHTE - STRUKTURDIAGNOSE")
+          for index, meeting in enumerate(sorted(historical_reports), 1):
+              report = all_reports[meeting]
+              print("--- Bericht", index, "von", len(historical_reports), "---")
+              try:
+                  content, final_url = fetch(report["report_url"])
+                  if parameters(final_url).get("meeting") != meeting:
+                      raise RuntimeError("Meeting-ID stimmt nicht")
+                  headings = [category(txt(h)) for h in content.select("h1,h2,h3,h4")]
+                  tables = content.select("table")
+                  if not tables:
+                      raise RuntimeError("Keine Tabellen")
+                  # A report is structurally readable, not yet validated for import.
+                  people = set()
+                  for a in content.select('a[href*="playerPortrait"]'):
+                      u = urljoin(final_url, a["href"])
+                      if urlparse(u).hostname == HOST:
+                          person = parameters(u).get("person")
+                          if person in person_owners:
+                              people.add(person)
+                  matched_members.update(people)
+                  no_member_links += not bool(people)
+                  print("Ueberschriften-Kategorien:", dict(Counter(headings)))
+                  print("Erkannte eigene Personen-IDs (Anzahl):", len(people))
+                  print("Von Portraits erwartete Personen (Anzahl):", len(report["person_ids"]))
+                  print("Davon im Bericht verlinkt:", len(people & report["person_ids"]))
+                  print("Tabellen:", len(tables))
+                  signature = []
+                  for j, table in enumerate(tables, 1):
+                      rows = [r for r in table.find_all("tr") if r.find_parent("table") is table]
+                      headers = []
+                      shapes = Counter()
+                      score_rows = 0
+                      link_rows = 0
+                      section = Counter()
+                      for row in rows:
+                          cells = row.find_all(["td", "th"], recursive=False)
+                          if not cells: continue
+                          if all(c.name == "th" for c in cells):
+                              headers.append([safe_header(c) for c in cells])
+                          shapes[len(cells)] += 1
+                          if any(re.fullmatch(r"\d+\s*:\s*\d+", txt(c)) for c in cells):
+                              score_rows += 1
+                          if row.select_one('a[href*="playerPortrait"]'):
+                              link_rows += 1
+                          if len(cells) == 1:
+                              section[category(txt(cells[0]))] += 1
+                      preceding = table.find_previous(["h1", "h2", "h3", "h4"])
+                      kind = category(txt(preceding)) if preceding else "other"
+                      print(json.dumps({"table":j,"section":kind,"rows":len(rows),"cell_counts":dict(shapes),"headers":headers,"score_rows":score_rows,"player_link_rows":link_rows,"section_rows":dict(section)}, ensure_ascii=False))
+                      signature.append((kind, len(rows), score_rows))
+                  formats[tuple(signature)] += 1
+                  readable += 1
+              except Exception as exc:
+                  reason = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else type(exc).__name__
+                  errors[reason] += 1
+                  print("Abruf/Strukturfehler:", reason)
+          print("=" * 60)
+          print("HISTORISCHE BERICHTE - ZUSAMMENFASSUNG")
+          print("Gefunden:", len(historical_reports))
+          print("Strukturell lesbar:", readable)
+          print("Unterschiedliche Tabellen-Signaturen:", len(formats))
+          print("Eigene Personen mit Berichtslinks:", len(matched_members))
+          print("Berichte ohne eigene Personenlinks:", no_member_links)
+          print("Fehler:", dict(errors))
+          print("Keine Datenbankaenderungen; keine freigegebenen Importdaten.")
+          if errors or readable != len(historical_reports):
+              raise RuntimeError("Berichtsdiagnose unvollstaendig")
+
+          print("KARRIEREERKENNUNG ERFOLGREICH (nur verlinkte Daten)")
+          print("KEINE DATENBANKÄNDERUNGEN")
+          print("GAME ON!")
+          PY
