@@ -11,6 +11,9 @@ on:
       complete:
         description: Beide Darthelfer-Importphasen vollstaendig
         value: ${{ jobs.import.outputs.complete }}
+      safe_to_reconcile:
+        description: Nur vollstaendige Importe oder freigegebene historische Quellluecken
+        value: ${{ jobs.import.outputs.safe_to_reconcile }}
 
 permissions:
   contents: read
@@ -21,6 +24,7 @@ jobs:
     timeout-minutes: 180
     outputs:
       complete: ${{ steps.darthelfer.outputs.complete }}
+      safe_to_reconcile: ${{ steps.darthelfer.outputs.safe_to_reconcile }}
 
     steps:
       - name: Darthelfer Einzelspiele, Liga-Doppel und Highlights
@@ -112,7 +116,7 @@ jobs:
               except ValueError:
                   return None
 
-          def request_json(
+          def _request_json(
               url,
               data=None,
               headers=None,
@@ -175,6 +179,20 @@ jobs:
                           raise
 
                       time.sleep(5 * (2 ** attempt))
+
+          class DatabaseError(RuntimeError):
+              pass
+
+          def request_json(url, data=None, headers=None, method="GET"):
+              try:
+                  return _request_json(url, data, headers, method)
+              except Exception as error:
+                  if url.startswith(URL + "/rest/v1/"):
+                      raise DatabaseError("Supabase-Anfrage fehlgeschlagen: " + type(error).__name__) from None
+                  raise
+
+          current_outcomes = {}
+          source_archive_500 = set()
 
           def upsert(table, data, conflict):
 
@@ -366,11 +384,14 @@ jobs:
               else:
                   data["import_completed_at"] = None
 
-              patch(
+              saved = patch(
                   "pc_events",
                   event["id"],
                   data
               )
+              if not isinstance(saved, list) or len(saved) != 1 or saved[0].get("id") != event["id"]:
+                  raise DatabaseError("Veranstaltungsstatus nicht eindeutig gespeichert")
+              current_outcomes[event["id"]] = (status, error)
 
           def import_event(event_id, event):
 
@@ -1555,6 +1576,11 @@ jobs:
 
                   except Exception as error:
 
+                      if isinstance(error, DatabaseError):
+                          raise
+                      if isinstance(error, urllib.error.HTTPError) and error.code == 500 and (error.url or "").startswith(BASE + "/gameausarchiv/x01/"):
+                          source_archive_500.add(event["id"])
+
                       if isinstance(
                           error,
                           urllib.error.HTTPError
@@ -2188,7 +2214,41 @@ jobs:
                   "error_message": "Ergaenzungsimport: " + type(error).__name__
               })
               raise
+          def assess_import(problems, outcomes, archive_500, totals, ext_partial):
+              if ext_partial or totals["events_deferred"]:
+                  return False
+              if len(problems) != totals["events_failed"] + totals["events_partial"]:
+                  return False
+              for p in problems:
+                  eid = p["event_id"]
+                  status, error = p["import_status"], p["import_error"]
+                  if p["known_exception"] is not True or outcomes.get(eid) != (status, error):
+                      return False
+                  if (status, error) == ("failed", "HTTP 500"):
+                      if eid not in archive_500:
+                          return False
+                  elif (status, error) != ("partial", "Keine Matchreferenzen vorhanden"):
+                      return False
+              return True
+
+          problems = []
+          while True:
+              rows = db_get("pc_import_problems", {
+                  "select": "event_id,event_name,import_status,import_error,known_exception",
+                  "order": "event_id.asc", "limit": 250, "offset": len(problems)
+              })
+              if not isinstance(rows, list):
+                  raise DatabaseError("Importprobleme nicht lesbar")
+              problems.extend(rows)
+              if len(rows) < 250:
+                  break
+          safe = assess_import(problems, current_outcomes, source_archive_500, totals, ext_partial)
+          if safe and problems:
+              print(f"::warning::{len(problems)} bekannte historische Quellluecken; Gesamtabgleich freigegeben.")
+          if not safe:
+              print("::error::Import nicht vollstaendig oder Fehler nicht eindeutig als bekannte Quellluecke bestaetigt.")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("complete=" + str(not (incomplete or ext_partial)).lower() + "\n")
+              output.write("complete=" + str(not (incomplete or ext_partial or problems)).lower() + "\n")
+              output.write("safe_to_reconcile=" + str(safe).lower() + "\n")
           print("GAME ON!")
           PY

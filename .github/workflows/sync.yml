@@ -31,10 +31,10 @@ jobs:
     steps:
       - name: Importvollstaendigkeit pruefen
         env:
-          DARTHELFER_COMPLETE: ${{ needs.darthelfer.outputs.complete }}
+          DARTHELFER_SAFE: ${{ needs.darthelfer.outputs.safe_to_reconcile }}
         run: |
-          if [ "$DARTHELFER_COMPLETE" != "true" ]; then
-            echo "::error::Darthelfer-Teilimport: Gesamtabgleich bewusst nicht ausgefuehrt."
+          if [ "$DARTHELFER_SAFE" != "true" ]; then
+            echo "::error::Darthelfer-Import nicht freigegeben: Gesamtabgleich bewusst nicht ausgefuehrt."
             exit 1
           fi
       - name: Supabase Gesamtabgleich
@@ -51,6 +51,11 @@ jobs:
           headers = {'apikey': key, 'Content-Type': 'application/json'}
           if not key.startswith('sb_secret_'):
               headers['Authorization'] = 'Bearer ' + key
+          check = urllib.request.Request(url + '/rest/v1/pc_import_problems?select=event_id&known_exception=eq.false&limit=1', headers=headers)
+          with urllib.request.urlopen(check, timeout=45) as response:
+              problems = json.load(response)
+          if not isinstance(problems, list) or problems:
+              raise RuntimeError('Neue Importprobleme: Gesamtabgleich gesperrt')
           req = urllib.request.Request(url + '/rest/v1/rpc/pc_reconcile_all', data=b'{}', headers=headers, method='POST')
           try:
               with urllib.request.urlopen(req, timeout=120) as response:
