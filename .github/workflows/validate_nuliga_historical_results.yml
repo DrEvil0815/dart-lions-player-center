@@ -929,6 +929,19 @@ jobs:
                   if score != win or sets != win: raise ValueError('Sieger oder Satzsumme widerspruechlich')
                   pp = [people(c[1],url), people(c[2],url)]
                   if k != 'team' and any(len(p) != (1 if k == 'singles' else 2) or len({x[0] for x in p}) != len(p) for p in pp):
+                      print('AUFSTELLUNGSDIAGNOSE:', json.dumps({
+                          'match_label': label, 'match_type': k, 'legs': legs,
+                          'expected_per_side': 1 if k == 'singles' else 2,
+                          'sides': [{'person_links': len(p),
+                                     'distinct_person_ids': len({x[0] for x in p}),
+                                     'all_links': len(c[i+1].select('a[href]')),
+                                     'text_fragments': len(list(c[i+1].stripped_strings)),
+                                     'empty': not bool(txt(c[i+1])),
+                                     'placeholder': bool(re.search(r'nicht angetreten|kampflos|no show|walkover|nicht besetzt|unbesetzt', txt(c[i+1]), re.I)),
+                                     'contains_own_person': any(x[0] in expected for x in p),
+                                     'html_tags': dict(Counter(x.name for x in c[i+1].find_all(True)))}
+                                    for i,p in enumerate(pp)]
+                      }, ensure_ascii=False))
                       raise ValueError('Aufstellung nicht eindeutig')
                   if {x[0] for x in pp[0]} & {x[0] for x in pp[1]}: raise ValueError('Person auf beiden Seiten')
                   for p in pp: seen.update(x[0] for x in p)
@@ -957,7 +970,7 @@ jobs:
 
           selftest()
           counts, formats, failures = Counter(), Counter(), Counter()
-          print('HISTORISCHE ERGEBNISVALIDIERUNG V1.0')
+          print('HISTORISCHE ERGEBNISVALIDIERUNG V1.1')
           for index, meeting in enumerate(sorted(historical_reports),1):
               report = all_reports[meeting]
               try:
@@ -979,7 +992,7 @@ jobs:
               except Exception as e:
                   reason = str(e) if isinstance(e,ValueError) else f'HTTP {e.code}' if isinstance(e,HTTPError) else type(e).__name__
                   failures[reason]+=1
-                  print('Bericht',index,'| PRUEFUNG OFFEN:',reason)
+                  print('Bericht',index,'| Meeting-ID:',meeting,'| PRUEFUNG OFFEN:',reason)
           print('ERGEBNISVALIDIERUNG:',dict(counts))
           print('FORMATVARIANTEN:',[(dict(k),v) for k,v in formats.items()])
           print('FEHLER:',dict(failures))
