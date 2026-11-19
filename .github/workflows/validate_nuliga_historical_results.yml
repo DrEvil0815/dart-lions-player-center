@@ -970,9 +970,10 @@ jobs:
 
           selftest()
           counts, formats, failures = Counter(), Counter(), Counter()
-          print('HISTORISCHE ERGEBNISVALIDIERUNG V1.1')
+          print('HISTORISCHE ERGEBNISVALIDIERUNG V1.2')
           for index, meeting in enumerate(sorted(historical_reports),1):
               report = all_reports[meeting]
+              print("Spielbericht-URL:", report["report_url"])
               try:
                   content, url = fetch(report['report_url'])
                   if parameters(url).get('meeting') != meeting: raise ValueError('Falsche Meeting-ID')
