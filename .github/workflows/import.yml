@@ -38,13 +38,13 @@ jobs:
           def fetch(url):
               if urlparse(url).hostname != 'bdv-dart.liga.nu': raise ValueError('Unbekannter Host')
               time.sleep(1)
-              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.1','Accept':'text/html'}),timeout=35) as r:
+              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.2','Accept':'text/html'}),timeout=35) as r:
                   body=r.read()
                   soup=BeautifulSoup(body,'html.parser')
                   print('HTTP:',r.status,'| URL:',r.geturl(),'| Typ:',r.headers.get('Content-Type'),'| Bytes:',len(body))
                   print('Titel:',txt(soup.title) if soup.title else '(fehlt)')
                   print('Meta vorhanden:',bool(soup.select_one('meta[name=nuLigaStatsUrl]')),'| Content vorhanden:',bool(soup.select_one('#content')))
-                  if not soup.select_one('meta[name=nuLigaStatsUrl]') or not soup.select_one('#content h1'):
+                  if not soup.select_one('#content h1'):
                       print('Seitentext:',txt(soup.body or soup)[:700])
                   return soup
           def players(cell):
@@ -109,20 +109,39 @@ jobs:
               if len(sys.argv)>1:
                   for path in sys.argv[1:]: show(parse(BeautifulSoup(open(path,encoding='utf-8').read(),'html.parser')))
               else:
-                  # Known reports first; discovery from group pages is tested separately.
+                  # Discover actual public report links from official full schedules.
                   failures=0
-                  for mid,group,champ in [('6106644','211419','OFr+2026%2F27'),('6106663','211419','OFr+2026%2F27'),('6114326','211398','Oberfranken+Pokal+26%2F27')]:
-                      url=WA+'groupMeetingReport/view?meeting='+mid+'&championship='+champ+'&group='+group
-                      if mid=='6114326': url=WA+'clubMeetingReport/view?meeting='+mid+'&championship='+champ+'&group='+group+'&club=6042'
-                      print('\n--- Test:',mid,'---')
-                      print('Anfrage:',url)
+                  targets={'6106644','6106663','6114326'}
+                  tested=set()
+                  for group,champ in [('211419','OFr+2026%2F27'),('211398','Oberfranken+Pokal+26%2F27')]:
+                      url=WA+'groupPage?championship='+champ+'&group='+group+'&displayDetail=meetings&displayTyp=gesamt'
+                      print('\n--- Spielplan:',group,'---')
                       try:
-                          d=parse(fetch(url))
-                          if d['meeting'] != mid: raise ValueError('Falscher Spielbericht')
-                          show(d)
+                          schedule=fetch(url)
+                          links={}
+                          for a in schedule.select('a[href]'):
+                              href=urljoin(url,a['href'])
+                              mid=param(href,'meeting')
+                              if mid in targets and 'MeetingReport' in urlparse(href).path and urlparse(href).hostname=='bdv-dart.liga.nu':
+                                  links[mid]=href
+                          print('Gefundene Testlinks:',links)
+                          for mid,href in links.items():
+                              if mid in tested: continue
+                              tested.add(mid)
+                              print('\n--- Test:',mid,'---')
+                              print('Anfrage:',href)
+                              try:
+                                  d=parse(fetch(href))
+                                  if d['meeting'] != mid: raise ValueError('Falscher Spielbericht')
+                                  show(d)
+                              except Exception as e:
+                                  failures+=1
+                                  print('FEHLER:',type(e).__name__,str(e))
                       except Exception as e:
-                          failures+=1
-                          print('FEHLER:',type(e).__name__,str(e))
-                  print('\nTest abgeschlossen. Fehler:',failures,'von 3')
+                          print('SPIELPLAN-FEHLER:',type(e).__name__,str(e))
+                  missing=targets-tested
+                  failures+=len(missing)
+                  print('Nicht gefundene Testberichte:',sorted(missing))
+                  print('Test abgeschlossen. Fehler:',failures,'von 3')
                   if failures: sys.exit(1)
           PYCODE
