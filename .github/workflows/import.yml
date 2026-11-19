@@ -49,8 +49,10 @@ jobs:
           def fetch(url):
               if urlparse(url).hostname != 'bdv-dart.liga.nu': raise ValueError('Unbekannter Host')
               time.sleep(1)
-              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.5','Accept':'text/html'}),timeout=35) as r:
+              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.7','Accept':'text/html'}),timeout=35) as r:
                   body=r.read()
+                  if r.status != 200 or urlparse(r.geturl()).hostname != 'bdv-dart.liga.nu' or 'html' not in r.headers.get('Content-Type','').lower() or not re.search(rb'</html\s*>',body,re.I):
+                      raise ValueError('HTML-Antwort unvollstaendig oder unerwartet')
                   soup=BeautifulSoup(body,'html.parser')
                   print('HTTP:',r.status,'| URL:',r.geturl(),'| Typ:',r.headers.get('Content-Type'),'| Bytes:',len(body))
                   print('Titel:',txt(soup.title) if soup.title else '(fehlt)')
@@ -104,6 +106,10 @@ jobs:
               if sum(CLUB in c for c in clubs)!=1: raise ValueError('Vereinsseite nicht eindeutig')
               side=1 if CLUB in clubs[0] else 2
               highlights=[]; averages=[]
+              headings=[txt(h) for h in content.select('h2,h3,h4')]
+              for required in ('Bestleistungen 180er','Bestleistungen High Finishes','Bestleistungen Low Darts'):
+                  if headings.count(required)!=1: raise ValueError('Bestleistungsabschnitt fehlt oder doppelt: '+required)
+              seen_av=set(); seen_h=set()
               section=''
               for node in content.select('h1,h2,h3,h4,table'):
                   if node.name!='table':
@@ -115,19 +121,36 @@ jobs:
                   heads=header(t)
                   avside={'Heimmannschaft':1,'Gastmannschaft':2}.get(' '.join(heads))
                   if avside and any('Average' in txt(r) for r in t.select('tr')[:3]):
+                      if avside in seen_av: raise ValueError('Average-Tabelle doppelt')
+                      seen_av.add(avside)
                       for row in t.select('tr'):
                           c=row.find_all('td',recursive=False)
-                          if len(c)!=2: continue
+                          if not c: continue
+                          if len(c)!=2: raise ValueError('Unerwartete Average-Zeile')
                           p=players(c[0]); val=float(txt(c[1]).replace(',','.'))
                           if len(p)!=1 or not 0<=val<=180: raise ValueError('Average unklar')
                           averages.append(dict(player=p[0],side=avside,average=val))
                       continue
                   typ='180' if '180er' in label else 'highfinish' if 'High Finish' in label else 'short_leg' if 'Low Darts' in label else None
-                  if not typ or not {'Anzahl','Wert'}.issubset(heads): continue
+                  if not typ: continue
+                  if not {'Anzahl','Wert'}.issubset(heads): raise ValueError('Bestleistungstabelle unklar')
+                  if typ in seen_h: raise ValueError('Bestleistungstabelle doppelt')
+                  seen_h.add(typ)
                   for row in t.select('tr'):
                       c=row.find_all('td',recursive=False)
-                      if len(c)<4: continue
+                      if not c: continue
+                      if len(c)!=4: raise ValueError('Unerwartete Bestleistungszeile')
                       highlights.append(dict(type=typ,count=int(txt(c[0])),value=int(txt(c[1])),players=players(c[2]),team=txt(c[-1]),section=label))
+              if ('Average der Spieler' in headings and seen_av != {1,2}) or ('Average der Spieler' not in headings and seen_av):
+                  raise ValueError('Average-Abschnitt unvollstaendig')
+              if len({m['label'] for m in matches}) != len(matches): raise ValueError('Matchbezeichnungen doppelt')
+              expect=Counter({'singles':8,'doubles':2}) if group=='211398' else Counter({'singles':16,'doubles':2})
+              actual=Counter(m['type'] for m in matches)
+              if group=='211398' and actual.get('team')==1: expect['team']=1
+              if actual!=expect: raise ValueError('Spielberichtformat unvollstaendig')
+              for m in matches:
+                  a,b=m['legs']; x,y=m['result']
+                  if a==b or (x,y)!=((1,0) if a>b else (0,1)): raise ValueError('Matchsieger widerspruechlich')
               return dict(meeting=mid,group=group,date=date,competition=list(content.h1.stripped_strings)[1],event_time=re.search(r'(\d{2}:\d{2})\s*Uhr',heading).group(1),home=home,away=away,side=side,legs=totals[0],result=totals[1],approved=any(txt(p)=='Spielbericht durch Spielleiter genehmigt.' for p in content.select('p')),matches=matches,highlights=highlights,averages=averages)
           def show(d):
               print(f"{d['meeting']} | {d['date']} | {d['home']} - {d['away']} | {d['result']} | Legs {d['legs']} | Lions Seite {d['side']} | genehmigt {d['approved']}")
@@ -146,53 +169,67 @@ jobs:
                   links[mid]=href
               return links
 
+          def payload(d,href):
+              mid=d['meeting']; side=d['side']; home=d['home']; away=d['away']
+              event=dict(nuliga_match_id=mid,nuliga_group_id=d['group'],season='2026/27',competition_name=d['competition'],competition_type='cup' if d['group']=='211398' else 'league',event_date=datetime.strptime(d['date'],'%d.%m.%Y').date().isoformat(),event_time=d['event_time'],home_team=home,away_team=away,lions_team=home if side==1 else away,is_home_match=side==1,home_score=d['result'][0],away_score=d['result'][1],home_legs=d['legs'][0],away_legs=d['legs'][1],is_finished=True,is_approved=d['approved'],report_url=href,report_status='approved' if d['approved'] else 'provisional',raw_data=d)
+              ms=[]
+              for n,m in enumerate(d['matches'],1):
+                  a,b=m['legs']; x,y=m['result']; ps=[]
+                  if m['type']!='team':
+                      for i,group in enumerate(m['players']):
+                          for j,p in enumerate(group):
+                              ps.append(dict(nuliga_person_id=p['person'],player_name=p['name'],player_side=i+1,player_position=j+1,won=m['result'][i]>m['result'][1-i],legs_won=m['legs'][i],legs_lost=m['legs'][1-i],raw_data=p))
+                  ms.append(dict(match_number=n,match_type=m['type'],home_legs=a,away_legs=b,winner_side=1 if x>y else 2,raw_data=m,players=ps))
+              av=[dict(nuliga_person_id=a['player']['person'],source_key=str(a['side'])+':'+a['player']['person'],player_name=a['player']['name'],player_side=a['side'],average=a['average'],average_type='matchday',raw_data=a) for a in d['averages']]
+              hs={}
+              for h in d['highlights']:
+                  pp=h['players']; single=len(pp)==1 and bool(pp[0]['person']); hs_side=1 if h['team']==home else 2 if h['team']==away else None
+                  if hs_side is None or h['count']<=0 or h['value']<=0: raise ValueError('Bestleistung unklar')
+                  identity=','.join(sorted(p['person'] or p['name'] for p in pp)) or h['team']
+                  sk=f"{h['type']}:{h['value']}:{hs_side}:{identity}"
+                  if sk in hs: hs[sk]['highlight_count']+=h['count']; continue
+                  hs[sk]=dict(nuliga_person_id=pp[0]['person'] if single else None,player_name=' / '.join(p['name'] for p in pp) or None,team_name=h['team'],player_side=hs_side,highlight_type=h['type'],highlight_value=h['value'],highlight_count=h['count'],match_type='unknown',attribution='player' if single else 'team' if len(pp)>1 else 'unknown',source_key=sk,raw_data=h)
+              return dict(event=event,matches=ms,averages=av,highlights=list(hs.values()),source_validation=dict(matches=True,averages=True,highlights=True))
+
           def save_reports(reports):
               base=os.environ['SUPABASE_URL'].strip().rstrip('/').removesuffix('/rest/v1')+'/rest/v1/'
               key=os.environ['SUPABASE_SERVICE_ROLE_KEY'].strip()
               if not key or not base.startswith('https://'): raise RuntimeError('Supabase-Zugangsdaten fehlen')
-              headers={'apikey':key,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=representation'}
+              headers={'apikey':key,'Content-Type':'application/json'}
               if not key.startswith('sb_secret_'): headers['Authorization']='Bearer '+key
-              def api(table,method='GET',query=None,body=None):
-                  url=base+table+('?' + urlencode(query) if query else '')
+              def api(path,method='GET',query=None,body=None):
+                  url=base+path+('?' + urlencode(query) if query else '')
                   req=Request(url,data=json.dumps(body,ensure_ascii=False).encode() if body is not None else None,headers=headers,method=method)
                   try:
                       with urlopen(req,timeout=60) as r: return json.loads(r.read())
                   except Exception as e:
-                      raise RuntimeError(f'Supabase {table}: {type(e).__name__} {getattr(e,"code", "")}') from None
-              def put(table,rows,conflict):
-                  if not rows: return []
-                  return api(table,'POST',{'on_conflict':conflict},rows)
-              counts=Counter()
-              stamp=datetime.now(timezone.utc).isoformat()
+                      raise RuntimeError(f'Supabase {path}: {type(e).__name__} {getattr(e,"code", "")}') from None
+              ready=[]
               for d,href in reports:
-                  mid=d['meeting']; side=d['side']; home=d['home']; away=d['away']
-                  event=dict(nuliga_match_id=mid,nuliga_group_id=d['group'],season='2026/27',competition_name=d['competition'],competition_type='cup' if d['group']=='211398' else 'league',event_date=datetime.strptime(d['date'],'%d.%m.%Y').date().isoformat(),event_time=d['event_time'],home_team=home,away_team=away,lions_team=home if side==1 else away,is_home_match=side==1,home_score=d['result'][0],away_score=d['result'][1],home_legs=d['legs'][0],away_legs=d['legs'][1],is_finished=True,is_approved=d['approved'],report_url=href,report_status='approved' if d['approved'] else 'provisional',raw_data=d,synced_at=stamp)
-                  # Stable keys. Do not overwrite reconciliation columns or existing IDs.
-                  eid=put('pc_nuliga_events',[event],'nuliga_match_id')[0]['id']
-                  ms=[]
-                  for n,m in enumerate(d['matches'],1):
-                      a,b=m['legs']; x,y=m['result']
-                      ms.append(dict(event_id=eid,match_number=n,match_type=m['type'],home_legs=a,away_legs=b,winner_side=1 if x>y else 2 if y>x else None,is_finished=True,raw_data=m,synced_at=stamp))
-                  saved=put('pc_nuliga_matches',ms,'event_id,match_number'); ids={r['match_number']:r['id'] for r in saved}
-                  ps=[]
-                  for n,m in enumerate(d['matches'],1):
-                      if m['type']=='team': continue
-                      for i,group in enumerate(m['players']):
-                          for j,p in enumerate(group):
-                              ps.append(dict(match_id=ids[n],nuliga_person_id=p['person'],player_name=p['name'],player_side=i+1,player_position=j+1,is_home_player=i==0,won=m['result'][i]>m['result'][1-i],legs_won=m['legs'][i],legs_lost=m['legs'][1-i],raw_data=p,synced_at=stamp))
-                  av=[dict(event_id=eid,nuliga_person_id=a['player']['person'],source_key=str(a['side'])+':'+a['player']['person'],player_name=a['player']['name'],player_side=a['side'],average=a['average'],average_type='matchday',raw_data=a,synced_at=stamp) for a in d['averages']]
-                  hs={}
-                  for h in d['highlights']:
-                      pp=h['players']; single=len(pp)==1 and bool(pp[0]['person']); hs_side=1 if h['team']==home else 2 if h['team']==away else None
-                      identity=','.join(sorted(p['person'] or p['name'] for p in pp)) or h['team']
-                      sk=f"{h['type']}:{h['value']}:{hs_side}:{identity}"
-                      if sk in hs: hs[sk]['highlight_count']+=h['count']; continue
-                      hs[sk]=dict(event_id=eid,nuliga_person_id=pp[0]['person'] if single else None,player_name=' / '.join(p['name'] for p in pp) or None,team_name=h['team'],player_side=hs_side,highlight_type=h['type'],highlight_value=h['value'],highlight_count=h['count'],match_type='unknown',attribution='player' if single else 'team' if len(pp)>1 else 'unknown',source_key=sk,raw_data=h,synced_at=stamp)
-                  for table,rows,conflict in [('pc_nuliga_players',ps,'match_id,player_side,player_position'),('pc_nuliga_averages',av,'event_id,source_key,average_type'),('pc_nuliga_highlights',list(hs.values()),'event_id,source_key')]:
-                      put(table,rows,conflict); counts[table]+=len(rows)
-                  counts['pc_nuliga_events']+=1; counts['pc_nuliga_matches']+=len(ms)
-                  print('GESPEICHERT:',mid,'genehmigt:',d['approved'],flush=True)
+                  data=payload(d,href)
+                  old=api('pc_nuliga_events',query={'select':'raw_data','nuliga_match_id':'eq.'+d['meeting']})
+                  if old:
+                      raw=old[0]['raw_data']; labels=[m['label'] for m in raw['matches']]; newlabels=[m['label'] for m in d['matches']]
+                      if [x for x in labels if x!='Team'] != [x for x in newlabels if x!='Team'] or ('Team' in labels and labels[-1]!='Team') or ('Team' in newlabels and newlabels[-1]!='Team'):
+                          raise ValueError('Matchreihenfolge geaendert: '+d['meeting'])
+                      # An absent optional section can mean deletion OR an incomplete source page.
+                      # Hold ambiguous full-section losses rather than silently erase records.
+                      for typ in ('180','highfinish','short_leg'):
+                          if any(h['type']==typ for h in raw['highlights']) and not any(h['type']==typ for h in d['highlights']):
+                              raise ValueError('Bestleistungsabschnitt jetzt leer, manuelle Pruefung erforderlich: '+d['meeting']+' '+typ)
+                      if raw['averages'] and not d['averages']:
+                          raise ValueError('Average-Abschnitt jetzt leer, manuelle Pruefung erforderlich: '+d['meeting'])
+                  ready.append(data)
+              counts=Counter(); deleted=Counter()
+              for data in ready:
+                  result=api('rpc/pc_nuliga_sync_validated_report','POST',body={'p_report':data})
+                  if not isinstance(result,dict): raise RuntimeError('Unerwartete RPC-Antwort')
+                  expected={'matches':len(data['matches']),'players':sum(len(m['players']) for m in data['matches']),'averages':len(data['averages']),'highlights':len(data['highlights'])}
+                  if any(result.get(k)!=v for k,v in expected.items()): raise RuntimeError('RPC-Anzahlen abweichend')
+                  counts.update(expected); counts['events']+=1; deleted.update(result['deleted'])
+                  print('GESPEICHERT:',data['event']['nuliga_match_id'],json.dumps(result),flush=True)
               print('DATENBANK GESAMT:',json.dumps(dict(counts)))
+              print('BEREINIGUNG GESAMT:',json.dumps(dict(deleted)))
 
           if __name__=='__main__':
               if len(sys.argv)>1:
@@ -216,6 +253,9 @@ jobs:
                           try:
                               d=parse(fetch(href))
                               if d['meeting']!=mid or d['group']!=group: raise ValueError('Falscher Spielbericht')
+                              second=parse(fetch(href))
+                              if d!=second: raise ValueError('Zwei Abrufe liefern unterschiedliche Daten')
+                              print('ZWEITABRUF: OK',mid)
                               show(d)
                               reports.append((d,href))
                               if not d['approved']:
