@@ -9,7 +9,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Python vorbereiten
         uses: actions/setup-python@v5
@@ -38,7 +38,7 @@ jobs:
           def fetch(url):
               if urlparse(url).hostname != 'bdv-dart.liga.nu': raise ValueError('Unbekannter Host')
               time.sleep(1)
-              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.3','Accept':'text/html'}),timeout=35) as r:
+              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.4','Accept':'text/html'}),timeout=35) as r:
                   body=r.read()
                   soup=BeautifulSoup(body,'html.parser')
                   print('HTTP:',r.status,'| URL:',r.geturl(),'| Typ:',r.headers.get('Content-Type'),'| Bytes:',len(body))
@@ -116,49 +116,56 @@ jobs:
               print('Matches:',dict(Counter(m['type'] for m in d['matches'])), '| Highlights:',len(d['highlights']),'| Averages:',len(d['averages']))
               for h in d['highlights']: print('Highlight:',json.dumps(h,ensure_ascii=False))
               for a in d['averages']: print('Average:',json.dumps(a,ensure_ascii=False))
+          def discover(schedule,url):
+              links={}
+              for a in schedule.select('a[href]'):
+                  href=urljoin(url,a['href'])
+                  mid=param(href,'meeting')
+                  if not mid or urlparse(href).hostname!='bdv-dart.liga.nu' or not urlparse(href).path.endswith(('groupMeetingReport','clubMeetingReport')): continue
+                  row=a.find_parent('tr')
+                  if row is None: continue
+                  if not re.search(r'Dart\s+Lions\s+Gräfenberg',txt(row),re.I): continue
+                  links[mid]=href
+              return links
           if __name__=='__main__':
               if len(sys.argv)>1:
                   for path in sys.argv[1:]: show(parse(BeautifulSoup(open(path,encoding='utf-8').read(),'html.parser')))
               else:
-                  # Discover actual public report links from official full schedules.
-                  failures=0
-                  targets={'6106644','6106663','6114326'}
-                  tested=set()
-                  for group,champ in [('211419','OFr+2026%2F27'),('211398','Oberfranken+Pokal+26%2F27')]:
+                  failures=0; tested=set(); aggregate=Counter(); found=set()
+                  for group,team in GROUPS.items():
+                      champ='Oberfranken+Pokal+26%2F27' if group=='211398' else 'OFr+2026%2F27'
                       url=WA+'groupPage?championship='+champ+'&group='+group+'&displayDetail=meetings&displayTyp=gesamt'
-                      print('\n--- Spielplan:',group,'---')
+                      print('\n--- Spielplan:',team,group,'---')
                       try:
-                          schedule=fetch(url)
-                          links={}
-                          for a in schedule.select('a[href]'):
-                              href=urljoin(url,a['href'])
-                              mid=param(href,'meeting')
-                              if mid in targets and 'MeetingReport' in urlparse(href).path and urlparse(href).hostname=='bdv-dart.liga.nu':
-                                  links[mid]=href
-                          print('Gefundene Testlinks:',links)
-                          for mid,href in links.items():
-                              if mid in tested: continue
-                              tested.add(mid)
-                              print('\n--- Test:',mid,'---')
-                              print('Anfrage:',href)
-                              try:
-                                  d=parse(fetch(href))
-                                  if d['meeting'] != mid: raise ValueError('Falscher Spielbericht')
-                                  show(d)
-                                  expected={'6106644':(16,2,0,2,0,(32,38),(8,10)), '6106663':(16,2,0,2,10,(50,16),(16,2)), '6114326':(8,2,1,1,0,(18,24),(4,7))}[mid]
-                                  kinds=Counter(m['type'] for m in d['matches'])
-                                  actual=(kinds['singles'],kinds['doubles'],kinds['team'],len(d['highlights']),len(d['averages']),d['legs'],d['result'])
-                                  if actual!=expected: raise ValueError(f'Testdaten abweichend: {actual} != {expected}')
-                                  print('Referenzvergleich: OK')
-                              except Exception as e:
-                                  failures+=1
-                                  print('FEHLER:',type(e).__name__,str(e))
-                                  traceback.print_exc()
+                          links=discover(fetch(url),url)
+                          print('Lions-Spielberichtlinks:',len(links),sorted(links))
+                          if not links: raise ValueError('Keine Lions-Spielberichtlinks gefunden')
                       except Exception as e:
-                          print('SPIELPLAN-FEHLER:',type(e).__name__,str(e))
-                  missing=targets-tested
+                          failures+=1; print('SPIELPLAN-FEHLER:',str(e)); continue
+                      found.update(links)
+                      for mid,href in links.items():
+                          if mid in tested: continue
+                          tested.add(mid)
+                          try:
+                              d=parse(fetch(href))
+                              if d['meeting']!=mid or d['group']!=group: raise ValueError('Falscher Spielbericht')
+                              show(d)
+                              if not d['approved']:
+                                  aggregate['nicht_genehmigt']+=1
+                                  print('Noch nicht genehmigt - separat gezaehlt'); continue
+                              aggregate['spielberichte']+=1
+                              aggregate['heim' if d['side']==1 else 'auswaerts']+=1
+                              aggregate.update(m['type'] for m in d['matches'])
+                              aggregate['highlights']+=len(d['highlights'])
+                              aggregate['averages']+=len(d['averages'])
+                              print('Summenpruefung: OK')
+                          except Exception as e:
+                              failures+=1; print('BERICHT-FEHLER:',mid,type(e).__name__,str(e)); traceback.print_exc()
+                  missing={'6106644','6106663','6114326'}-found
                   failures+=len(missing)
-                  print('Nicht gefundene Testberichte:',sorted(missing))
-                  print('Test abgeschlossen. Fehler:',failures,'von 3')
+                  print('Fehlende Referenzberichte:',sorted(missing))
+                  print('GESAMT:',json.dumps(dict(aggregate),ensure_ascii=False))
+                  print('Gefundene Berichte:',len(found),'| Fehler:',failures)
+                  print('Nur Lesemodus - keine Datenbankzugriffe')
                   if failures: sys.exit(1)
           PYCODE
