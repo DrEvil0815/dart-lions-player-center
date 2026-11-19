@@ -1,0 +1,226 @@
+
+name: Player Center - nuLiga Mannschafts-IDs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Python vorbereiten
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: HTML Parser installieren
+        run: python -m pip install beautifulsoup4==4.13.4
+
+      - name: Mannschafts-IDs ermitteln
+        run: |
+          python -u - <<'PY'
+          import json
+          import time
+          from urllib.request import Request, urlopen
+          from urllib.parse import urljoin, urlparse, parse_qs
+          from bs4 import BeautifulSoup
+
+          CLUB = "6042"
+          HOST = "bdv-dart.liga.nu"
+
+          BASE = (
+              "https://" + HOST +
+              "/cgi-bin/WebObjects/"
+              "nuLigaDARTDE.woa/wa/"
+          )
+
+          CLUB_URL = BASE + "clubTeams?club=" + CLUB
+
+          def txt(element):
+              return " ".join(element.stripped_strings)
+
+          def fetch(url):
+
+              if urlparse(url).hostname != HOST:
+                  raise RuntimeError("Unbekannter Host")
+
+              time.sleep(1)
+
+              request = Request(
+                  url,
+                  headers={
+                      "User-Agent": "Dart Lions Player Center/2.0",
+                      "Accept": "text/html"
+                  }
+              )
+
+              with urlopen(request, timeout=45) as response:
+
+                  if urlparse(response.geturl()).hostname != HOST:
+                      raise RuntimeError("Unbekanntes Weiterleitungsziel")
+
+                  soup = BeautifulSoup(
+                      response.read(),
+                      "html.parser"
+                  )
+
+              content = soup.select_one("#content")
+
+              if content is None:
+                  raise RuntimeError("Seiteninhalt fehlt")
+
+              return content
+
+          content = fetch(CLUB_URL)
+
+          if "Mannschaften und Ligeneinteilung" not in txt(content):
+              raise RuntimeError("Falsche Vereinsseite")
+
+          groups = {}
+
+          for row in content.select("table tr"):
+
+              cells = row.find_all(
+                  "td",
+                  recursive=False
+              )
+
+              if len(cells) < 3:
+                  continue
+
+              link = cells[1].select_one(
+                  'a[href*="groupPage"]'
+              )
+
+              if not link:
+                  continue
+
+              href = urljoin(CLUB_URL, link["href"])
+
+              params = parse_qs(
+                  urlparse(href).query
+              )
+
+              group_id = params.get(
+                  "group", [None]
+              )[0]
+
+              championship = params.get(
+                  "championship", [None]
+              )[0]
+
+              if not group_id or not championship:
+                  raise RuntimeError("Gruppendaten fehlen")
+
+              key = (championship, group_id)
+
+              group = groups.setdefault(
+                  key,
+                  {
+                      "url": href,
+                      "teams": set()
+                  }
+              )
+
+              group["teams"].add(txt(cells[0]))
+
+          if not groups:
+              raise RuntimeError("Keine Gruppen erkannt")
+
+          print("=" * 60)
+          print("DART LIONS PLAYER CENTER")
+          print("MANNSCHAFTS-ID-ERKENNUNG")
+          print("=" * 60)
+
+          results = []
+          unresolved = []
+
+          for (championship, group_id), group in groups.items():
+
+              print("-" * 60)
+              print("Wettbewerb:", championship)
+              print("Gruppe:", group_id)
+
+              content = fetch(group["url"])
+
+              for team in sorted(group["teams"]):
+
+                  candidates = []
+
+                  for link in content.select("a[href]"):
+
+                      if txt(link) != team:
+                          continue
+
+                      href = urljoin(
+                          group["url"],
+                          link["href"]
+                      )
+
+                      parsed = urlparse(href)
+
+                      if parsed.hostname != HOST:
+                          continue
+
+                      params = parse_qs(parsed.query)
+
+                      item = {
+                          "text": txt(link),
+                          "path": parsed.path,
+                          "parameters": params,
+                          "url": href
+                      }
+
+                      if item not in candidates:
+                          candidates.append(item)
+
+                  team_ids = {
+                      value
+                      for candidate in candidates
+                      for key, values in candidate["parameters"].items()
+                      if key.lower() in ("team", "teamid")
+                      for value in values
+                      if value.isdigit()
+                  }
+
+                  item = {
+                      "team": team,
+                      "championship": championship,
+                      "group_id": group_id,
+                      "team_ids": sorted(team_ids),
+                      "links": candidates
+                  }
+
+                  results.append(item)
+
+                  if len(team_ids) != 1:
+                      unresolved.append(item)
+
+                  print(json.dumps(
+                      item,
+                      ensure_ascii=False,
+                      indent=2
+                  ))
+
+          print("=" * 60)
+          print("ERGEBNIS")
+          print("=" * 60)
+
+          print("Wettbewerbsgruppen:", len(groups))
+          print("Teilnahmen:", len(results))
+          print("Eindeutig erkannte IDs:",
+                len(results) - len(unresolved))
+          print("Ungeklaerte IDs:", len(unresolved))
+
+          if unresolved:
+              print("WEITERE LINKANALYSE ERFORDERLICH")
+          else:
+              print("TEST ERFOLGREICH")
+
+          print("GAME ON!")
+          PY
