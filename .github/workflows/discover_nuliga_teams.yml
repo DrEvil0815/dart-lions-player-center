@@ -41,8 +41,10 @@ jobs:
 
           CLUB_URL = BASE + "clubTeams?club=" + CLUB
 
+
           def txt(element):
               return " ".join(element.stripped_strings)
+
 
           def fetch(url):
 
@@ -54,7 +56,7 @@ jobs:
               request = Request(
                   url,
                   headers={
-                      "User-Agent": "Dart Lions Player Center/2.0",
+                      "User-Agent": "Dart Lions Player Center/2.1",
                       "Accept": "text/html"
                   }
               )
@@ -62,7 +64,9 @@ jobs:
               with urlopen(request, timeout=45) as response:
 
                   if urlparse(response.geturl()).hostname != HOST:
-                      raise RuntimeError("Unbekanntes Weiterleitungsziel")
+                      raise RuntimeError(
+                          "Unbekanntes Weiterleitungsziel"
+                      )
 
                   soup = BeautifulSoup(
                       response.read(),
@@ -76,10 +80,12 @@ jobs:
 
               return content
 
+
           content = fetch(CLUB_URL)
 
           if "Mannschaften und Ligeneinteilung" not in txt(content):
               raise RuntimeError("Falsche Vereinsseite")
+
 
           groups = {}
 
@@ -100,7 +106,10 @@ jobs:
               if not link:
                   continue
 
-              href = urljoin(CLUB_URL, link["href"])
+              href = urljoin(
+                  CLUB_URL,
+                  link["href"]
+              )
 
               params = parse_qs(
                   urlparse(href).query
@@ -115,9 +124,14 @@ jobs:
               )[0]
 
               if not group_id or not championship:
-                  raise RuntimeError("Gruppendaten fehlen")
+                  raise RuntimeError(
+                      "Gruppendaten fehlen"
+                  )
 
-              key = (championship, group_id)
+              key = (
+                  championship,
+                  group_id
+              )
 
               group = groups.setdefault(
                   key,
@@ -127,18 +141,26 @@ jobs:
                   }
               )
 
-              group["teams"].add(txt(cells[0]))
+              group["teams"].add(
+                  txt(cells[0])
+              )
+
 
           if not groups:
-              raise RuntimeError("Keine Gruppen erkannt")
+              raise RuntimeError(
+                  "Keine Gruppen erkannt"
+              )
+
 
           print("=" * 60)
           print("DART LIONS PLAYER CENTER")
-          print("MANNSCHAFTS-ID-ERKENNUNG")
+          print("MANNSCHAFTS-ID-ERKENNUNG V2.1")
           print("=" * 60)
+
 
           results = []
           unresolved = []
+
 
           for (championship, group_id), group in groups.items():
 
@@ -146,7 +168,9 @@ jobs:
               print("Wettbewerb:", championship)
               print("Gruppe:", group_id)
 
-              content = fetch(group["url"])
+              content = fetch(
+                  group["url"]
+              )
 
               for team in sorted(group["teams"]):
 
@@ -167,7 +191,24 @@ jobs:
                       if parsed.hostname != HOST:
                           continue
 
-                      params = parse_qs(parsed.query)
+                      if not parsed.path.endswith(
+                          "/teamPortrait"
+                      ):
+                          continue
+
+                      params = parse_qs(
+                          parsed.query
+                      )
+
+                      if params.get(
+                          "group", [None]
+                      ) != [group_id]:
+                          continue
+
+                      if params.get(
+                          "championship", [None]
+                      ) != [championship]:
+                          continue
 
                       item = {
                           "text": txt(link),
@@ -179,22 +220,51 @@ jobs:
                       if item not in candidates:
                           candidates.append(item)
 
+
                   team_ids = {
                       value
+
                       for candidate in candidates
-                      for key, values in candidate["parameters"].items()
-                      if key.lower() in ("team", "teamid")
+
+                      for key, values in
+                          candidate["parameters"].items()
+
+                      if key.lower() == "teamtable"
+
                       for value in values
+
                       if value.isdigit()
                   }
 
+
                   item = {
+
+                      "club_id": CLUB,
+
                       "team": team,
+
                       "championship": championship,
+
                       "group_id": group_id,
+
+                      "competition_type": (
+                          "cup"
+                          if "pokal" in championship.lower()
+                          else "league"
+                      ),
+
                       "team_ids": sorted(team_ids),
+
+                      "teamtable_id": (
+                          next(iter(team_ids))
+                          if len(team_ids) == 1
+                          else None
+                      ),
+
                       "links": candidates
+
                   }
+
 
                   results.append(item)
 
@@ -207,20 +277,115 @@ jobs:
                       indent=2
                   ))
 
+
+          resolved = [
+              r for r in results
+              if r["teamtable_id"] is not None
+          ]
+
+
+          unique_teamtable_ids = {
+              r["teamtable_id"]
+              for r in resolved
+          }
+
+
+          unique_teams = {
+              r["team"]
+              for r in results
+          }
+
+
+          print("=" * 60)
+          print("ERKANNTE MANNSCHAFTEN")
+          print("=" * 60)
+
+
+          for r in resolved:
+
+              print(
+                  r["team"]
+                  + " | "
+                  + r["competition_type"]
+                  + " | Gruppe: "
+                  + r["group_id"]
+                  + " | Teamtable-ID: "
+                  + r["teamtable_id"]
+              )
+
+
           print("=" * 60)
           print("ERGEBNIS")
           print("=" * 60)
 
-          print("Wettbewerbsgruppen:", len(groups))
-          print("Teilnahmen:", len(results))
-          print("Eindeutig erkannte IDs:",
-                len(results) - len(unresolved))
-          print("Ungeklaerte IDs:", len(unresolved))
+          print(
+              "Mannschaften:",
+              len(unique_teams)
+          )
+
+          print(
+              "Wettbewerbsgruppen:",
+              len(groups)
+          )
+
+          print(
+              "Teilnahmen:",
+              len(results)
+          )
+
+          print(
+              "Eindeutig erkannte IDs:",
+              len(resolved)
+          )
+
+          print(
+              "Unterschiedliche Teamtable-IDs:",
+              len(unique_teamtable_ids)
+          )
+
+          print(
+              "Ungeklaerte IDs:",
+              len(unresolved)
+          )
+
+          print(
+              "Ligateilnahmen:",
+              sum(
+                  r["competition_type"] == "league"
+                  for r in results
+              )
+          )
+
+          print(
+              "Pokalteilnahmen:",
+              sum(
+                  r["competition_type"] == "cup"
+                  for r in results
+              )
+          )
+
 
           if unresolved:
-              print("WEITERE LINKANALYSE ERFORDERLICH")
-          else:
-              print("TEST ERFOLGREICH")
 
+              print(
+                  "WEITERE LINKANALYSE ERFORDERLICH"
+              )
+
+              raise RuntimeError(
+                  "Nicht alle Mannschafts-IDs "
+                  "konnten eindeutig ermittelt werden"
+              )
+
+
+          if len(unique_teamtable_ids) != len(results):
+
+              raise RuntimeError(
+                  "Doppelte Teamtable-IDs erkannt"
+              )
+
+
+          print("=" * 60)
+          print("ALLE MANNSCHAFTS-IDS ERFOLGREICH ERKANNT")
+          print("TEST ERFOLGREICH")
           print("GAME ON!")
           PY
