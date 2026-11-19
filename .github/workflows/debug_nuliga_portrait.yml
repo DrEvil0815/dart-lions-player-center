@@ -1,0 +1,143 @@
+
+name: Player Center - nuLiga Portrait Diagnose
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Python vorbereiten
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: HTML Parser installieren
+        run: python -m pip install beautifulsoup4==4.13.4
+
+      - name: Spielerportrait untersuchen
+        run: |
+          python -u - <<'PY'
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlencode, urljoin
+          from bs4 import BeautifulSoup
+
+          BASE = (
+              "https://bdv-dart.liga.nu/"
+              "cgi-bin/WebObjects/"
+              "nuLigaDARTDE.woa/wa/"
+          )
+
+          URL = BASE + "playerPortrait?" + urlencode({
+              "federation": "BDV",
+              "season": "2026/27",
+              "person": "2498499",
+              "club": "6042"
+          })
+
+          request = Request(
+              URL,
+              headers={
+                  "User-Agent": "Dart Lions Player Center/2.2",
+                  "Accept": "text/html"
+              }
+          )
+
+          with urlopen(request, timeout=45) as response:
+
+              print("HTTP Status:", response.status)
+              print("Finale URL:", response.geturl())
+              print("Content-Type:", response.headers.get("Content-Type"))
+
+              final_url = response.geturl()
+              html = response.read()
+
+          soup = BeautifulSoup(html, "html.parser")
+
+          print("=" * 60)
+          print("HTML DIAGNOSE")
+          print("=" * 60)
+
+          print("HTML Groesse:", len(html))
+
+          print(
+              "Seitentitel:",
+              soup.title.get_text(strip=True)
+              if soup.title else "FEHLT"
+          )
+
+          content = soup.select_one("#content")
+
+          if content is None:
+              print("CONTENT FEHLT")
+              content = soup
+
+          print("=" * 60)
+          print("UEBERSCHRIFTEN")
+          print("=" * 60)
+
+          for element in content.select("h1, h2, h3, h4"):
+              print(element.name, element.get_text(" ", strip=True))
+
+          print("=" * 60)
+          print("TABELLENSTRUKTUR")
+          print("=" * 60)
+
+          for index, table in enumerate(content.select("table"), 1):
+
+              print("Tabelle:", index)
+
+              for row in table.select("tr")[:15]:
+
+                  cells = row.find_all(
+                      ["td", "th"],
+                      recursive=False
+                  )
+
+                  print([
+                      {
+                          "tag": cell.name,
+                          "text": cell.get_text(" ", strip=True)[:200]
+                      }
+                      for cell in cells
+                  ])
+
+          print("=" * 60)
+          print("SAISONVERLINKUNGEN")
+          print("=" * 60)
+
+          for link in content.select('a[href*="playerPortrait"]'):
+
+              text = link.get_text(" ", strip=True)
+
+              if "saison" in text.lower():
+
+                  print("TEXT:", text)
+                  print("URL:", urljoin(final_url, link["href"]))
+
+          print("=" * 60)
+          print("SAISON HTML")
+          print("=" * 60)
+
+          for element in content.find_all(string=True):
+
+              if "saisonen" in element.strip().lower():
+
+                  print(str(element.parent.parent)[:5000])
+
+          print("=" * 60)
+          print("SEITENINHALT OHNE HTML")
+          print("=" * 60)
+
+          print(content.get_text(" ", strip=True)[:6000])
+
+          print("=" * 60)
+          print("DIAGNOSE ABGESCHLOSSEN")
+          print("GAME ON!")
+          PY
