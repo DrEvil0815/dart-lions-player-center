@@ -1,0 +1,231 @@
+
+name: Player Center - nuLiga Mannschaftserkennung
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Python vorbereiten
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: HTML Parser installieren
+        run: python -m pip install beautifulsoup4==4.13.4
+
+      - name: Mannschaften und Wettbewerbe erkennen
+        run: |
+          python -u - <<'PY'
+          import json
+          import re
+          from urllib.request import Request, urlopen
+          from urllib.parse import urljoin, urlparse, parse_qs
+          from bs4 import BeautifulSoup
+
+          CLUB = "6042"
+
+          URL = (
+              "https://bdv-dart.liga.nu/"
+              "cgi-bin/WebObjects/"
+              "nuLigaDARTDE.woa/wa/"
+              "clubTeams?club=" + CLUB
+          )
+
+          def txt(element):
+              return " ".join(element.stripped_strings)
+
+          request = Request(
+              URL,
+              headers={
+                  "User-Agent": "Dart Lions Player Center/2.0",
+                  "Accept": "text/html"
+              }
+          )
+
+          with urlopen(request, timeout=45) as response:
+              soup = BeautifulSoup(
+                  response.read(),
+                  "html.parser"
+              )
+
+          content = soup.select_one("#content")
+
+          if content is None:
+              raise RuntimeError("Seiteninhalt fehlt")
+
+          if "Mannschaften und Ligeneinteilung" not in txt(content):
+              raise RuntimeError("Falsche Vereinsseite")
+
+          participations = []
+          seen = set()
+
+          print("=" * 60)
+          print("DART LIONS PLAYER CENTER")
+          print("DYNAMISCHE MANNSCHAFTSERKENNUNG")
+          print("=" * 60)
+
+          for table in content.select("table"):
+
+              for row in table.select("tr"):
+
+                  cells = row.find_all(
+                      "td",
+                      recursive=False
+                  )
+
+                  if len(cells) < 3:
+                      continue
+
+                  link = cells[1].select_one(
+                      'a[href*="groupPage"]'
+                  )
+
+                  if not link:
+                      continue
+
+                  href = urljoin(URL, link["href"])
+                  parsed = urlparse(href)
+
+                  if parsed.hostname != "bdv-dart.liga.nu":
+                      raise RuntimeError("Unerwarteter Host")
+
+                  params = parse_qs(parsed.query)
+
+                  group = params.get("group", [None])[0]
+                  championship = params.get(
+                      "championship",
+                      [None]
+                  )[0]
+
+                  if not group or not championship:
+                      raise RuntimeError("Wettbewerbs-ID fehlt")
+
+                  team = txt(cells[0])
+                  league = txt(link)
+
+                  season_match = re.search(
+                      r"(\d{4}|\d{2})/(\d{2,4})",
+                      championship
+                  )
+
+                  if not season_match:
+                      raise RuntimeError(
+                          "Spielzeit nicht erkannt: " + championship
+                      )
+
+                  start = int(season_match.group(1))
+
+                  if start < 100:
+                      start += 2000
+
+                  end = int(season_match.group(2))
+
+                  if end < 100:
+                      end += (start // 100) * 100
+                      if end < start:
+                          end += 100
+
+                  if end != start + 1:
+                      raise RuntimeError(
+                          "Unbekanntes Saisonformat: " + championship
+                      )
+
+                  season = f"{start}/{end % 100:02d}"
+
+                  competition_type = (
+                      "cup"
+                      if "pokal" in (
+                          championship + " " + league
+                      ).lower()
+                      else "league"
+                  )
+
+                  key = (
+                      season,
+                      championship,
+                      group,
+                      team
+                  )
+
+                  if key in seen:
+                      continue
+
+                  seen.add(key)
+
+                  item = {
+                      "club_id": CLUB,
+                      "season": season,
+                      "team": team,
+                      "competition_type": competition_type,
+                      "competition_name": league,
+                      "championship": championship,
+                      "group_id": group,
+                      "captain": txt(cells[2]),
+                      "group_url": href
+                  }
+
+                  participations.append(item)
+
+                  print("-" * 60)
+                  print(json.dumps(
+                      item,
+                      ensure_ascii=False,
+                      indent=2
+                  ))
+
+          if not participations:
+              raise RuntimeError(
+                  "Keine Mannschaften erkannt"
+              )
+
+          seasons = {
+              p["season"]
+              for p in participations
+          }
+
+          teams = {
+              p["team"]
+              for p in participations
+          }
+
+          groups = {
+              (p["championship"], p["group_id"])
+              for p in participations
+          }
+
+          print("=" * 60)
+          print("ERGEBNIS")
+          print("=" * 60)
+
+          print("Spielzeiten:", sorted(seasons))
+          print("Mannschaften:", len(teams))
+          print("Wettbewerbsgruppen:", len(groups))
+          print("Teilnahmen:", len(participations))
+
+          print(
+              "Ligateilnahmen:",
+              sum(
+                  p["competition_type"] == "league"
+                  for p in participations
+              )
+          )
+
+          print(
+              "Pokalteilnahmen:",
+              sum(
+                  p["competition_type"] == "cup"
+                  for p in participations
+              )
+          )
+
+          print("TEST ERFOLGREICH")
+          print("GAME ON!")
+          PY
