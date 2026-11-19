@@ -1,5 +1,8 @@
 name: Player Center - nuLiga Import
 on:
+  schedule:
+    - cron: '0 6 * * *'
+      timezone: Europe/Berlin
   workflow_dispatch:
     inputs:
       write_db:
@@ -26,7 +29,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          WRITE_DB: ${{ inputs.write_db }}
+          WRITE_DB: ${{ github.event_name == 'schedule' || inputs.write_db }}
         run: |
           python -u - <<'PYCODE'
           import re, json, sys, time, traceback, os
