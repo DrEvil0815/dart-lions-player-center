@@ -20,7 +20,7 @@ jobs:
       - name: Spielberichte lesend pruefen
         run: |
           python -u - <<'PYCODE'
-          import re, json, sys, time
+          import re, json, sys, time, traceback
           from urllib.parse import urljoin, urlparse, parse_qs
           from urllib.request import Request, urlopen
           from bs4 import BeautifulSoup
@@ -38,7 +38,7 @@ jobs:
           def fetch(url):
               if urlparse(url).hostname != 'bdv-dart.liga.nu': raise ValueError('Unbekannter Host')
               time.sleep(1)
-              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.2','Accept':'text/html'}),timeout=35) as r:
+              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.3','Accept':'text/html'}),timeout=35) as r:
                   body=r.read()
                   soup=BeautifulSoup(body,'html.parser')
                   print('HTTP:',r.status,'| URL:',r.geturl(),'| Typ:',r.headers.get('Content-Type'),'| Bytes:',len(body))
@@ -56,8 +56,18 @@ jobs:
               content=s.select_one('#content')
               if not content or not content.h1: raise ValueError('Spielbericht-Inhalt fehlt')
               heading=txt(content.h1); date=re.search(r'(\d{2}\.\d{2}\.\d{4})',heading).group(1)
-              table=next(h.find_next_sibling('table') for h in content.select('h2') if txt(h)=='Spielbericht')
-              headers=table.select('tr')[0].find_all('th'); home,away=map(txt,headers[1:3]); matches=[]; totals=None
+              tables=content.select('table')
+              def header(t):
+                  r=t.find('tr')
+                  return [txt(c) for c in r.find_all(['th','td'],recursive=False)] if r else []
+              print('Ueberschriften:',[(h.name,txt(h)) for h in content.select('h1,h2,h3,h4')])
+              print('Tabellenkoepfe:',[header(t) for t in tables])
+              candidates=[t for t in tables if any(re.fullmatch(r'\d+-\d+|D\d+-D\d+|Team',txt(r.find('td')),re.I) for r in t.select('tr') if r.find('td')) and re.search(r'Legs:\s*\d+\s*:\s*\d+',txt(t))]
+              if len(candidates)!=1: raise ValueError(f'Spielberichtstabelle nicht eindeutig: {len(candidates)} Kandidaten')
+              table=candidates[0]
+              headers=header(table)
+              if len(headers)<4: raise ValueError('Tabellenkopf zu kurz: '+str(headers))
+              home,away=headers[1:3]; matches=[]; totals=None
               for row in table.select('tr')[1:]:
                   c=row.find_all('td',recursive=False)
                   if not c: continue
@@ -76,29 +86,30 @@ jobs:
               if sum(CLUB in c for c in clubs)!=1: raise ValueError('Vereinsseite nicht eindeutig')
               side=1 if CLUB in clubs[0] else 2
               highlights=[]; averages=[]
-              for h in content.select('h2'):
-                  label=txt(h); tables=[]
-                  for n in h.find_next_siblings():
-                      if n.name=='h2': break
-                      if n.name=='table': tables.append(n)
-                  if label.startswith('Bestleistungen'):
-                      typ='180' if '180er' in label else 'highfinish' if 'High Finish' in label else 'short_leg' if 'Low Darts' in label else None
-                      if not typ: continue
-                      for t in tables:
-                          for row in t.select('tr'):
-                              c=row.find_all('td',recursive=False)
-                              if len(c)<4: continue
-                              highlights.append(dict(type=typ,count=int(txt(c[0])),value=int(txt(c[1])),players=players(c[2]),team=txt(c[-1]),section=label))
-                  if label=='Average der Spieler':
-                      for t in tables:
-                          header=txt(t.select_one('tr')); avside={'Heimmannschaft':1,'Gastmannschaft':2}.get(header)
-                          if not avside: raise ValueError('Average-Seite unbekannt')
-                          for row in t.select('tr'):
-                              c=row.find_all('td',recursive=False)
-                              if len(c)!=2: continue
-                              p=players(c[0]); val=float(txt(c[1]).replace(',','.'))
-                              if len(p)!=1 or not 0<=val<=180: raise ValueError('Average unklar')
-                              averages.append(dict(player=p[0],side=avside,average=val))
+              section=''
+              for node in content.select('h1,h2,h3,h4,table'):
+                  if node.name!='table':
+                      section=txt(node)
+                      continue
+                  if node is table: continue
+                  t=node
+                  label=section
+                  heads=header(t)
+                  avside={'Heimmannschaft':1,'Gastmannschaft':2}.get(' '.join(heads))
+                  if avside and any('Average' in txt(r) for r in t.select('tr')[:3]):
+                      for row in t.select('tr'):
+                          c=row.find_all('td',recursive=False)
+                          if len(c)!=2: continue
+                          p=players(c[0]); val=float(txt(c[1]).replace(',','.'))
+                          if len(p)!=1 or not 0<=val<=180: raise ValueError('Average unklar')
+                          averages.append(dict(player=p[0],side=avside,average=val))
+                      continue
+                  typ='180' if '180er' in label else 'highfinish' if 'High Finish' in label else 'short_leg' if 'Low Darts' in label else None
+                  if not typ or not {'Anzahl','Wert'}.issubset(heads): continue
+                  for row in t.select('tr'):
+                      c=row.find_all('td',recursive=False)
+                      if len(c)<4: continue
+                      highlights.append(dict(type=typ,count=int(txt(c[0])),value=int(txt(c[1])),players=players(c[2]),team=txt(c[-1]),section=label))
               return dict(meeting=mid,group=group,date=date,home=home,away=away,side=side,legs=totals[0],result=totals[1],approved=any(txt(p)=='Spielbericht durch Spielleiter genehmigt.' for p in content.select('p')),matches=matches,highlights=highlights,averages=averages)
           def show(d):
               print(f"{d['meeting']} | {d['date']} | {d['home']} - {d['away']} | {d['result']} | Legs {d['legs']} | Lions Seite {d['side']} | genehmigt {d['approved']}")
@@ -134,9 +145,15 @@ jobs:
                                   d=parse(fetch(href))
                                   if d['meeting'] != mid: raise ValueError('Falscher Spielbericht')
                                   show(d)
+                                  expected={'6106644':(16,2,0,2,0,(32,38),(8,10)), '6106663':(16,2,0,2,10,(50,16),(16,2)), '6114326':(8,2,1,1,0,(18,24),(4,7))}[mid]
+                                  kinds=Counter(m['type'] for m in d['matches'])
+                                  actual=(kinds['singles'],kinds['doubles'],kinds['team'],len(d['highlights']),len(d['averages']),d['legs'],d['result'])
+                                  if actual!=expected: raise ValueError(f'Testdaten abweichend: {actual} != {expected}')
+                                  print('Referenzvergleich: OK')
                               except Exception as e:
                                   failures+=1
                                   print('FEHLER:',type(e).__name__,str(e))
+                                  traceback.print_exc()
                       except Exception as e:
                           print('SPIELPLAN-FEHLER:',type(e).__name__,str(e))
                   missing=targets-tested
