@@ -928,28 +928,31 @@ jobs:
                   win = (1,0) if legs[0] > legs[1] else (0,1)
                   if score != win or sets != win: raise ValueError('Sieger oder Satzsumme widerspruechlich')
                   pp = [people(c[1],url), people(c[2],url)]
-                  if k != 'team' and any(len(p) != (1 if k == 'singles' else 2) or len({x[0] for x in p}) != len(p) for p in pp):
-                      print('AUFSTELLUNGSDIAGNOSE:', json.dumps({
-                          'match_label': label, 'match_type': k, 'legs': legs,
-                          'expected_per_side': 1 if k == 'singles' else 2,
-                          'sides': [{'person_links': len(p),
-                                     'distinct_person_ids': len({x[0] for x in p}),
-                                     'all_links': len(c[i+1].select('a[href]')),
-                                     'text_fragments': len(list(c[i+1].stripped_strings)),
-                                     'empty': not bool(txt(c[i+1])),
-                                     'placeholder': bool(re.search(r'nicht angetreten|kampflos|no show|walkover|nicht besetzt|unbesetzt', txt(c[i+1]), re.I)),
-                                     'contains_own_person': any(x[0] in expected for x in p),
-                                     'html_tags': dict(Counter(x.name for x in c[i+1].find_all(True)))}
-                                    for i,p in enumerate(pp)]
-                      }, ensure_ascii=False))
-                      raise ValueError('Aufstellung nicht eindeutig')
+                  unresolved = []
+                  if k != 'team':
+                      required = 1 if k == 'singles' else 2
+                      for side, persons in enumerate(pp):
+                          cell = c[side+1]
+                          if len(persons) > required or len({x[0] for x in persons}) != len(persons):
+                              raise ValueError('Doppelte oder zu viele Personen-IDs')
+                          if len(persons) < required:
+                              if not txt(cell):
+                                  raise ValueError('Leere Aufstellung')
+                              unresolved.append(side+1)
+                      if unresolved:
+                          flags['lineup_review_matches'] += 1
+                          print('MANUELLE PRUEFUNG | Match:', label, '| Seiten:', unresolved, '| Verlinkte Personen:', [len(p) for p in pp])
                   if {x[0] for x in pp[0]} & {x[0] for x in pp[1]}: raise ValueError('Person auf beiden Seiten')
                   for p in pp: seen.update(x[0] for x in p)
-                  matches.append((label,k,legs,score,pp))
+                  # Originaltext nur im Speicher fuer den Zweitabruf; keine Namen im Log.
+                  matches.append((label,k,legs,score,pp,unresolved,[txt(c[1]),txt(c[2])]))
               if len(totals)!=1 or not matches: raise ValueError('Gesamtergebnis fehlt oder mehrfach')
               calc = tuple(tuple(sum(m[i][side] for m in matches) for side in (0,1)) for i in (2,3))
               if calc != totals[0]: raise ValueError('Summenabweichung Spiele oder Legs')
-              if not expected <= seen: raise ValueError('Erwartete Personen fehlen in Spielzeilen')
+              if not expected <= seen:
+                  flags['expected_persons_missing'] = len(expected - seen)
+                  if not flags['lineup_review_matches']:
+                      raise ValueError('Erwartete Personen fehlen in Spielzeilen')
               if len({m[0] for m in matches}) != len(matches): flags['repeated_labels'] += 1
               approved = any(txt(p).casefold() == 'spielbericht durch spielleiter genehmigt.' for p in content.select('p'))
               return dict(matches=matches, totals=totals[0], approved=approved, flags=dict(flags))
@@ -966,11 +969,20 @@ jobs:
                   try: parse_results(BeautifulSoup(bad,'html.parser'),url,{'1'})
                   except ValueError: pass
                   else: raise AssertionError('Fehler nicht erkannt')
+              unlinked = html.replace(link(1), 'Unverlinkter Spieler')
+              test = parse_results(BeautifulSoup(unlinked,'html.parser'),url,{'1'})
+              assert test['flags']['lineup_review_matches'] == 1
+              assert test['flags']['expected_persons_missing'] == 1
+              assert test['matches'][0][4][0] == []
+              for bad in (unlinked.replace('Legs: 3:1','Legs: 4:1'), html.replace(link(1), ''), html.replace(link(1),link(2))):
+                  try: parse_results(BeautifulSoup(bad,'html.parser'),url,{'1'})
+                  except ValueError: pass
+                  else: raise AssertionError('Fehler nicht erkannt')
               print('Lokaler Parser-Selbsttest: OK')
 
           selftest()
           counts, formats, failures = Counter(), Counter(), Counter()
-          print('HISTORISCHE ERGEBNISVALIDIERUNG V1.2')
+          print('HISTORISCHE ERGEBNISVALIDIERUNG V1.3')
           for index, meeting in enumerate(sorted(historical_reports),1):
               report = all_reports[meeting]
               print("Spielbericht-URL:", report["report_url"])
@@ -980,6 +992,13 @@ jobs:
                   d = parse_results(content,url,report['person_ids'])
                   content2, url2 = fetch(report['report_url'])
                   if parameters(url2).get('meeting') != meeting or d != parse_results(content2,url2,report['person_ids']): raise ValueError('Zweitabruf weicht ab')
+                  if meeting == '6099260' and d['totals'] != ((21,25),(4,8)):
+                      raise ValueError('Referenzergebnis weicht ab')
+                  review = bool(d['flags'].get('lineup_review_matches') or d['flags'].get('expected_persons_missing'))
+                  counts['reports_manual_review'] += review
+                  counts['matches_manual_review'] += d['flags'].get('lineup_review_matches',0)
+                  counts['reports_without_lineup_review'] += not review
+                  if review: print('Meeting-ID:',meeting,'| KEINE FREIGABE FUER PERSOENLICHE STATISTIK')
                   types = Counter(m[1] for m in d['matches'])
                   formats[tuple(sorted(types.items()))] += 1
                   counts.update(types)
@@ -999,6 +1018,9 @@ jobs:
           print('FEHLER:',dict(failures))
           print('Keine Datenbankaenderungen; Bestleistungen und AVG noch nicht validiert.')
           if failures or counts['validated'] != len(historical_reports): raise RuntimeError('Ergebnisvalidierung unvollstaendig')
-          print('ERGEBNISVALIDIERUNG ERFOLGREICH')
+          print('RECHNERISCHE ERGEBNISVALIDIERUNG ERFOLGREICH')
+          if counts['reports_manual_review']:
+              print('IDENTITAET / SPIELBERECHTIGUNG: MANUELLE PRUEFUNG OFFEN')
+          print('Keine Importfreigabe; keine Zuordnung anhand von Namen.')
           print('GAME ON!')
           PY
