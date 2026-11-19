@@ -38,12 +38,24 @@ jobs:
           def fetch(url):
               if urlparse(url).hostname != 'bdv-dart.liga.nu': raise ValueError('Unbekannter Host')
               time.sleep(1)
-              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.0','Accept':'text/html'}),timeout=35) as r: return BeautifulSoup(r.read(),'html.parser')
+              with urlopen(Request(url,headers={'User-Agent':'Dart Lions Player Center/1.1','Accept':'text/html'}),timeout=35) as r:
+                  body=r.read()
+                  soup=BeautifulSoup(body,'html.parser')
+                  print('HTTP:',r.status,'| URL:',r.geturl(),'| Typ:',r.headers.get('Content-Type'),'| Bytes:',len(body))
+                  print('Titel:',txt(soup.title) if soup.title else '(fehlt)')
+                  print('Meta vorhanden:',bool(soup.select_one('meta[name=nuLigaStatsUrl]')),'| Content vorhanden:',bool(soup.select_one('#content')))
+                  if not soup.select_one('meta[name=nuLigaStatsUrl]') or not soup.select_one('#content h1'):
+                      print('Seitentext:',txt(soup.body or soup)[:700])
+                  return soup
           def players(cell):
               return [{'name':txt(a),'person':param(a.get('href',''),'person'),'club':param(a.get('href',''),'club')} for a in cell.select('a[href*="playerPortrait"]')]
           def parse(s):
-              meta=s.select_one('meta[name=nuLigaStatsUrl]')['content']; mid=param(meta,'meeting'); group=param(meta,'group')
-              content=s.select_one('#content'); heading=txt(content.h1); date=re.search(r'(\d{2}\.\d{2}\.\d{4})',heading).group(1)
+              meta_tag=s.select_one('meta[name=nuLigaStatsUrl]')
+              if not meta_tag or not meta_tag.get('content'): raise ValueError('Kein nuLiga-Spielbericht: nuLigaStatsUrl fehlt')
+              meta=meta_tag['content']; mid=param(meta,'meeting'); group=param(meta,'group')
+              content=s.select_one('#content')
+              if not content or not content.h1: raise ValueError('Spielbericht-Inhalt fehlt')
+              heading=txt(content.h1); date=re.search(r'(\d{2}\.\d{2}\.\d{4})',heading).group(1)
               table=next(h.find_next_sibling('table') for h in content.select('h2') if txt(h)=='Spielbericht')
               headers=table.select('tr')[0].find_all('th'); home,away=map(txt,headers[1:3]); matches=[]; totals=None
               for row in table.select('tr')[1:]:
@@ -98,10 +110,19 @@ jobs:
                   for path in sys.argv[1:]: show(parse(BeautifulSoup(open(path,encoding='utf-8').read(),'html.parser')))
               else:
                   # Known reports first; discovery from group pages is tested separately.
+                  failures=0
                   for mid,group,champ in [('6106644','211419','OFr+2026%2F27'),('6106663','211419','OFr+2026%2F27'),('6114326','211398','Oberfranken+Pokal+26%2F27')]:
                       url=WA+'groupMeetingReport/view?meeting='+mid+'&championship='+champ+'&group='+group
                       if mid=='6114326': url=WA+'clubMeetingReport/view?meeting='+mid+'&championship='+champ+'&group='+group+'&club=6042'
-                      d=parse(fetch(url))
-                      if d['meeting'] != mid: raise ValueError('Falscher Spielbericht')
-                      show(d)
+                      print('\n--- Test:',mid,'---')
+                      print('Anfrage:',url)
+                      try:
+                          d=parse(fetch(url))
+                          if d['meeting'] != mid: raise ValueError('Falscher Spielbericht')
+                          show(d)
+                      except Exception as e:
+                          failures+=1
+                          print('FEHLER:',type(e).__name__,str(e))
+                  print('\nTest abgeschlossen. Fehler:',failures,'von 3')
+                  if failures: sys.exit(1)
           PYCODE
