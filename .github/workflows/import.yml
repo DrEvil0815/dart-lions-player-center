@@ -1,4 +1,3 @@
-
 name: Dart Lions Player Center - Import
 
 on:
@@ -19,7 +18,7 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Automatischer Darthelfer Einzelspielimport
+      - name: Darthelfer Einzelspiele, Liga-Doppel und Highlights
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -1759,5 +1758,300 @@ jobs:
               else "IMPORT ERFOLGREICH"
           )
 
+          print("GAME ON!")
+
+          # ============================================================
+          # ERGAENZUNG: historische und neue Liga-Doppel + Einzel-Highlights
+          # Der bestehende Einzelimport oberhalb bleibt unveraendert.
+          # ============================================================
+
+          def paged(table, params, page_size=250):
+              offset = 0
+              while True:
+                  rows = db_get(table, dict(params, order="id.asc", limit=page_size, offset=offset)) or []
+                  yield from rows
+                  if len(rows) < page_size:
+                      return
+                  offset += page_size
+
+
+          def insert_new_highlights(rows):
+              # Identische Schluessel wie beim historischen SQL-Import.
+              # Bestehende manuell gepruefte Eintraege nicht ueberschreiben.
+              if not rows:
+                  return
+              headers = dict(HEADERS, Prefer="resolution=ignore-duplicates,return=minimal")
+              for start in range(0, len(rows), 100):
+                  request_json(
+                      URL + "/rest/v1/pc_highlights?on_conflict=source,source_key",
+                      rows[start:start + 100], headers, "POST"
+                  )
+
+
+          def single_highlight(p, m, e, kind, value, count, key):
+              return {
+                  "member_id": p.get("member_id"),
+                  "event_id": m["event_id"], "match_id": m["id"],
+                  "player_name": p.get("player_name"),
+                  "darthelfer_player_id": p["darthelfer_player_id"],
+                  "darthelfer_user_id": p.get("darthelfer_user_id"),
+                  "nuliga_person_id": p.get("nuliga_person_id"),
+                  "highlight_type": kind, "highlight_value": value,
+                  "highlight_count": count, "highlight_date": e.get("event_date"),
+                  "match_type": "single", "attribution": "player",
+                  "player_side": p["player_side"], "source": "darthelfer",
+                  "source_key": key, "verification_status": "confirmed"
+              }
+
+
+          def sync_single_highlights():
+              player_fields = (
+                  "id,member_id,player_name,darthelfer_player_id,"
+                  "darthelfer_user_id,nuliga_person_id,player_side"
+              )
+              match_fields = (
+                  "id,event_id,match_type,is_finished,start_score,"
+                  "darthelfer_game_id,pc_events!inner(event_date,event_type)"
+              )
+              rows = []
+              for p in paged("pc_match_players", {
+                  "select": player_fields + ",count_180,highest_finish,raw_data,"
+                            "pc_matches!inner(" + match_fields + ")",
+                  "or": "(count_180.gt.0,highest_finish.gte.100)",
+                  "pc_matches.match_type": "eq.singles",
+                  "pc_matches.is_finished": "eq.true",
+                  "pc_matches.darthelfer_game_id": "not.is.null"
+              }):
+                  m = p["pc_matches"]
+                  e = m["pc_events"]
+                  count = p.get("count_180")
+                  if isinstance(count, int) and count > 0:
+                      rows.append(single_highlight(p, m, e, "180", 180, count, "180:" + p["id"]))
+                  finishes = (p.get("raw_data") or {}).get("highfinishes") or []
+                  if isinstance(finishes, list):
+                      for position, value in enumerate(finishes, 1):
+                          if isinstance(value, int) and 100 <= value <= 170:
+                              rows.append(single_highlight(
+                                  p, m, e, "highfinish", value, 1,
+                                  "highfinish:" + p["id"] + ":" + str(position)
+                              ))
+              for leg in paged("pc_legs", {
+                  "select": "id,darts_thrown,scored_points,won,pc_match_players!inner("
+                            + player_fields + ",pc_matches!inner(" + match_fields + "))",
+                  "won": "eq.true", "scored_points": "eq.501",
+                  "darts_thrown": "gte.9",
+                  "and": "(darts_thrown.lte.20)",
+                  "pc_match_players.pc_matches.match_type": "eq.singles",
+                  "pc_match_players.pc_matches.is_finished": "eq.true",
+                  "pc_match_players.pc_matches.darthelfer_game_id": "not.is.null"
+              }):
+                  p = leg["pc_match_players"]
+                  m = p["pc_matches"]
+                  e = m["pc_events"]
+                  # Nochmals lokal pruefen, damit keine nicht passenden Legs einfließen.
+                  if m.get("match_type") != "singles" or not m.get("is_finished"):
+                      continue
+                  if m.get("start_score") not in (None, 501):
+                      continue
+                  date = e.get("event_date")
+                  limit = 20 if e.get("event_type") == "competition" and date and date <= "2026-12-31" else 18
+                  if 9 <= leg["darts_thrown"] <= limit:
+                      rows.append(single_highlight(p, m, e, "short_leg", leg["darts_thrown"], 1,
+                                                   "short_leg:" + leg["id"]))
+              insert_new_highlights(rows)
+              print(f"Einzel-Highlights abgeglichen: {len(rows)} Kandidaten (inkl. bestehender)")
+
+
+          def double_partners(ref, lookup):
+              # Achtung: Darthelfer verwendet die erste Ziffer fuer die Seite,
+              # die zweite fuer die Position im Doppel. Am Originalspieltag geprueft.
+              result = []
+              team_ids = [ref.get("player1Id"), ref.get("player2Id")]
+              if not all(team_ids) or len(set(team_ids)) != 2:
+                  raise ValueError("Doppel-Team-IDs fehlen oder sind identisch")
+              for side in (1, 2):
+                  team = lookup.get(team_ids[side - 1], {})
+                  for position in (1, 2):
+                      pid = ref.get(f"doppelpartner{side}Player{position}Id")
+                      player = lookup.get(pid, {})
+                      if not pid or not player.get("name") or player.get("einzelspieler") is not True:
+                          raise ValueError("Doppelpartner nicht eindeutig identifiziert")
+                      home = player.get("heimmannschaft")
+                      if not isinstance(home, bool) or home != (side == 1):
+                          raise ValueError("Heim-/Gastzuordnung der Doppelpartner unklar")
+                      if isinstance(team.get("heimmannschaft"), bool) and team["heimmannschaft"] != home:
+                          raise ValueError("Doppel-Team und Partner widersprechen sich")
+                      result.append((side, position, pid, player))
+              if len({r[2] for r in result}) != 4 or set(team_ids) & {r[2] for r in result}:
+                  raise ValueError("Doppelpartner-IDs nicht eindeutig")
+              return result
+
+
+          def import_league_double(event, ref, lookup):
+              match_id = ref.get("id")
+              if not match_id:
+                  raise ValueError("Doppelreferenz ohne ID")
+              if ref.get("type") != "DP":
+                  raise ValueError("Kein Liga-Doppel")
+              scores = [ref.get("anzahlPlayer1"), ref.get("anzahlPlayer2")]
+              if not all(type(s) is int and s >= 0 for s in scores) or sum(scores) == 0:
+                  raise ValueError("Kein belastbares Doppel-Ergebnis")
+              partners = double_partners(ref, lookup)
+              source_id = ref.get("tournamentId") or event["darthelfer_event_id"]
+              team_ids = [ref.get("player1Id"), ref.get("player2Id")]
+              existing_rows = db_get("pc_matches", {
+                  "select": "id,event_id,darthelfer_match_id,match_type,raw_data,archive_available,darthelfer_game_id",
+                  "event_id": "eq." + event["id"],
+                  "darthelfer_match_id": "eq." + match_id,
+                  "limit": 2
+              }) or []
+              if len(existing_rows) > 1 or (existing_rows and existing_rows[0]["match_type"] != "doubles"):
+                  raise ValueError("Doppelreferenz kollidiert mit vorhandenem Match")
+              existing_double = existing_rows[0] if existing_rows else None
+              game_id = ref.get("gameId") or (existing_double or {}).get("darthelfer_game_id")
+              if game_id:
+                  same_game = db_get("pc_matches", {
+                      "select": "id,event_id,darthelfer_match_id,match_type",
+                      "darthelfer_game_id": "eq." + game_id, "limit": 2
+                  }) or []
+                  if len(same_game) > 1 or any(
+                      r["event_id"] != event["id"] or r["darthelfer_match_id"] != match_id
+                      or r["match_type"] != "doubles" for r in same_game
+                  ):
+                      raise ValueError("Doppel-Archiv-ID bereits unter anderer Referenz gespeichert")
+              archive = None
+              # Bereits gesicherte Rohdaten erhalten; bei fehlendem Archiv erneut versuchen.
+              old_raw = (existing_double or {}).get("raw_data") or {}
+              if isinstance(old_raw, dict) and isinstance(old_raw.get("archive"), dict):
+                  previous_archive = old_raw["archive"]
+                  if previous_archive.get("gameid") and (not game_id or previous_archive["gameid"] == game_id):
+                      archive = previous_archive
+              if archive is None:
+                  try:
+                      candidate = request_json(BASE + "/gameausarchiv/x01/" + source_id + "/" + match_id + "/tournamentgameid")
+                      if isinstance(candidate, dict) and candidate.get("gameid"):
+                          if game_id and candidate["gameid"] != game_id:
+                              print(f"Doppel {match_id}: widerspruechliche Archiv-ID, nur Ergebnis gesichert")
+                          else:
+                              archive = candidate
+                  except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+                      print(f"Doppel {match_id}: Archiv nicht erreichbar ({type(error).__name__}), Ergebnis wird gesichert")
+              if archive:
+                  game_id = archive["gameid"]
+                  found_game = db_get("pc_matches", {
+                      "select": "id,event_id,darthelfer_match_id,match_type",
+                      "darthelfer_game_id": "eq." + game_id, "limit": 2
+                  }) or []
+                  if len(found_game) > 1 or any(
+                      r["event_id"] != event["id"] or r["darthelfer_match_id"] != match_id
+                      or r["match_type"] != "doubles" for r in found_game
+                  ):
+                      raise ValueError("Doppel-Archiv kollidiert mit anderem Match")
+              match_data = {
+                  "event_id": event["id"], "darthelfer_match_id": match_id,
+                  "darthelfer_game_id": game_id, "source_tournament_id": source_id,
+                  "match_type": "doubles", "is_finished": True,
+                  "archive_available": archive is not None,
+                  "raw_data": {"league_ref": ref, "archive": archive}, "synced_at": now()
+              }
+              if archive and archive.get("endezeitpunkt"):
+                  match_data.update({
+                      "started_at": timestamp(archive.get("startzeitpunkt")),
+                      "played_at": timestamp(archive.get("startzeitpunkt")),
+                      "finished_at": timestamp(archive.get("endezeitpunkt")),
+                      "duration_minutes": archive.get("dauer")
+                  })
+              match = upsert("pc_matches", match_data, "event_id,darthelfer_match_id")[0]
+              # Zwei Teamzeilen fuer Ergebnis/Teamstatistik; keine Einzelspieler-ID verwenden.
+              # Archivwerte erst nach gepruefter Struktur als Doppelstatistik uebernehmen.
+              for side in (1, 2):
+                  team_id = team_ids[side - 1]
+                  names = [p[3]["name"] for p in partners if p[0] == side]
+                  team = {
+                      "match_id": match["id"], "darthelfer_player_id": team_id,
+                      "darthelfer_user_id": None, "nuliga_person_id": None,
+                      "nuliga_player_id": None, "member_id": None,
+                      "player_name": " / ".join(names), "player_side": side,
+                      "is_home_player": side == 1,
+                      "legs_won": scores[side - 1], "legs_lost": scores[2 - side],
+                      "won": None if scores[0] == scores[1] else scores[side - 1] > scores[2 - side]
+                  }
+                  upsert("pc_match_players", team, "match_id,darthelfer_player_id")
+              participants = []
+              for side, position, pid, p in partners:
+                  participants.append({
+                      "match_id": match["id"], "player_side": side, "player_position": position,
+                      "player_name": " ".join(p["name"].split()), "darthelfer_player_id": pid,
+                      "darthelfer_user_id": p.get("userId"), "nuliga_person_id": p.get("externPersonId"),
+                      "nuliga_player_id": p.get("externPlayerId"), "is_home_player": p.get("heimmannschaft")
+                  })
+              upsert("pc_doubles_players", participants, "match_id,player_side,player_position")
+              print(f"Liga-Doppel {match_id}: {scores[0]}:{scores[1]}, 4 Partner, Archiv {'ja' if archive else 'nein'}")
+              return archive is not None
+
+
+          def sync_league_doubles():
+              counts = Counter()
+              for event in paged("pc_events", {
+                  "select": "id,darthelfer_event_id,event_name,event_type,import_status",
+                  "event_type": "eq.league", "import_status": "neq.excluded"
+              }):
+                  if time.monotonic() - START_TIME > MAX_RUNTIME:
+                      print("Zeitlimit: uebrige Doppel werden beim naechsten Lauf geprueft")
+                      counts["deferred"] += 1
+                      break
+                  try:
+                      tournament = request_json(BASE + "/tournament/" + event["darthelfer_event_id"])
+                      main = tournament.get("turnierMain") or tournament.get("turnierGruppe") or {}
+                      if main.get("turniersystem") != "LIGASPIELTAG" or main.get("tournamentstatus") != "abgeschlossen":
+                          print(f"Kein abgeschlossener Liga-Spieltag: {event['event_name']}")
+                          continue
+                      if "test" in event["event_name"].lower():
+                          continue
+                      lookup = {}
+                      collect_players(tournament, lookup)
+                      refs = [r for r in main.get("tournamentLeagueGameEntities") or [] if r.get("type") == "DP"]
+                      print(f"{event['event_name']}: {len(refs)} Liga-Doppelreferenzen")
+                      if not refs:
+                          counts["no_refs"] += 1
+                      for ref in refs:
+                          if time.monotonic() - START_TIME > MAX_RUNTIME:
+                              counts["deferred"] += 1
+                              break
+                          try:
+                              has_archive = import_league_double(event, ref, lookup)
+                              counts["matches"] += 1
+                              counts["with_archive" if has_archive else "without_archive"] += 1
+                          except Exception as error:
+                              counts["errors"] += 1
+                              print(f"Doppel offen: {ref.get('id')} | {type(error).__name__}: {str(error)[:200]}")
+                          time.sleep(0.3)
+                  except Exception as error:
+                      counts["errors"] += 1
+                      print(f"Liga-Spieltag offen: {event['event_name']} | {type(error).__name__}: {str(error)[:200]}")
+              print("LIGA-DOPPEL-IMPORT:", dict(counts))
+              return counts
+
+
+          print("=" * 60)
+          print("ERGAENZUNGSIMPORT: EINZEL-HIGHLIGHTS UND LIGA-DOPPEL")
+          # Eigener Logeintrag: der Ergebnisstatus des urspruenglichen Einzelimports bleibt erhalten.
+          ext_log = request_json(URL + "/rest/v1/pc_sync_log", {"status": "running"}, HEADERS, "POST")[0]
+          ext_counts = Counter()
+          try:
+              sync_single_highlights()
+              ext_counts = sync_league_doubles()
+              ext_partial = bool(ext_counts["errors"] or ext_counts["without_archive"] or ext_counts["deferred"] or ext_counts["no_refs"])
+              patch("pc_sync_log", ext_log["id"], {
+                  "finished_at": now(), "status": "partial" if ext_partial else "success",
+                  "matches_imported": ext_counts["matches"],
+                  "error_message": "Liga-Doppel-Ergaenzung: " + json.dumps(dict(ext_counts), ensure_ascii=False)
+              })
+          except Exception as error:
+              patch("pc_sync_log", ext_log["id"], {
+                  "finished_at": now(), "status": "failed", "matches_imported": ext_counts["matches"],
+                  "error_message": "Ergaenzungsimport: " + type(error).__name__
+              })
+              raise
           print("GAME ON!")
           PY
