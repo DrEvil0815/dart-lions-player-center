@@ -1,6 +1,19 @@
 name: Player Center - nuLiga Historische Synchronisierung V2
 
 on:
+  workflow_call:
+    inputs:
+      write_import:
+        type: boolean
+        default: false
+      seed_season:
+        type: string
+        default: ""
+    secrets:
+      SUPABASE_URL:
+        required: true
+      SUPABASE_SERVICE_ROLE_KEY:
+        required: true
   workflow_dispatch:
     inputs:
       write_import:
