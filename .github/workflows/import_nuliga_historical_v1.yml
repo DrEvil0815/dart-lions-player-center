@@ -1,4 +1,4 @@
-name: Player Center - nuLiga Historischer Erstimport
+name: Player Center - nuLiga Historische Synchronisierung V2
 
 on:
   workflow_dispatch:
@@ -8,8 +8,17 @@ on:
         type: boolean
         default: false
 
+      seed_season:
+        description: "Optional: Start-Spielzeit (YYYY/YY), sonst automatisch ab Juli"
+        type: string
+        default: ""
+
 permissions:
   contents: read
+
+concurrency:
+  group: player-center-career-v2
+  cancel-in-progress: false
 
 jobs:
   discover:
@@ -25,6 +34,7 @@ jobs:
       - name: Historische Spielberichte untersuchen
         env:
           WRITE_IMPORT: ${{ inputs.write_import }}
+          SEED_SEASON: ${{ inputs.seed_season }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
@@ -54,7 +64,15 @@ jobs:
           )
 
           CLUB = "6042"
-          START_SEASON = "2026/27"
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          today = datetime.now(ZoneInfo("Europe/Berlin")).date()
+          start_year = today.year if today.month >= 7 else today.year - 1
+          START_SEASON = os.environ.get("SEED_SEASON", "").strip() or f"{start_year}/{(start_year+1)%100:02d}"
+          if not re.fullmatch(r"[0-9]{4}/[0-9]{2}", START_SEASON):
+              raise RuntimeError("Start-Spielzeit ungueltig")
+          if (int(START_SEASON[:4])+1)%100 != int(START_SEASON[5:]):
+              raise RuntimeError("Start-Spielzeit ungueltig")
 
           SUPABASE_URL = os.environ[
               "SUPABASE_URL"
@@ -472,7 +490,7 @@ jobs:
 
           print("=" * 60)
           print("DART LIONS PLAYER CENTER")
-          print("HISTORISCHE SPIELERKARRIEREN V1.1")
+          print("HISTORISCHE SPIELERKARRIEREN V2")
           print("=" * 60)
 
 
@@ -783,7 +801,6 @@ jobs:
           print("=" * 60)
 
 
-          print("Bekannter historischer Testbericht 6099260 gefunden:", "ja" if "6099260" in historical_reports else "nein")
           print("Historische Abschnitte ohne Berichtslinks (Verfuegbarkeit offen):", sum(not x["is_dart_lions"] and not x["report_count"] for x in all_careers))
 
 
@@ -863,8 +880,16 @@ jobs:
 
 
           print("=" * 60)
-          if "6099260" not in historical_reports:
-              raise RuntimeError("Bekannter historischer Testbericht fehlt; Zugriff oder Parser pruefen")
+          known = {r['meeting_id']: r for r in database_rows('pc_career_events', {
+              'select':'meeting_id,source_hash,report_url', 'order':'meeting_id.asc'})}
+          missing = set(known) - historical_reports
+          if missing:
+              print('Bekannte Berichte ohne wiedergefundenen Link:', sorted(missing))
+              raise RuntimeError('Historische Erkennung unvollstaendig; keine Schreiboperation')
+          print('Start-Spielzeit:', START_SEASON, '| bekannte Berichte:', len(known))
+          for mid in known:
+              # Keep the original report URL in the hash input (v1 compatibility).
+              all_reports[mid]['report_url'] = known[mid]['report_url']
 
 
           from collections import Counter
@@ -1123,8 +1148,6 @@ jobs:
                   d = parse_results(content,url,report['person_ids'])
                   content2, url2 = fetch(report['report_url'])
                   if parameters(url2).get('meeting') != meeting or d != parse_results(content2,url2,report['person_ids']): raise ValueError('Zweitabruf weicht ab')
-                  if meeting == '6099260' and d['totals'] != ((21,25),(4,8)):
-                      raise ValueError('Referenzergebnis weicht ab')
                   ex = parse_extras(content,url,d)
                   if ex != parse_extras(content2,url2,d): raise ValueError('Bestleistungen oder Bemerkungen im Zweitabruf abweichend')
                   event=build_event(content,url,report,d,ex)
@@ -1151,9 +1174,6 @@ jobs:
                   counts['approved_marker'] += d['approved']
                   counts['no_approval_marker'] += not d['approved']
                   print('Bericht',index,'| Format:',dict(types),'| Spiele:',d['totals'][1],'| Legs:',d['totals'][0],'| Genehmigungsvermerk:',d['approved'],'| Hinweise:',d['flags'])
-                  if meeting == '6099260':
-                      print('Referenzbericht 6099260:',d['totals']==((21,25),(4,8)))
-                      if d['totals']!=((21,25),(4,8)): raise ValueError('Referenzergebnis weicht ab')
               except Exception as e:
                   reason = str(e) if isinstance(e,ValueError) else f'HTTP {e.code}' if isinstance(e,HTTPError) else str(e) if isinstance(e,RuntimeError) and str(e) in {'Seiteninhalt fehlt','Unbekannter Host','Unbekanntes Weiterleitungsziel'} else type(e).__name__
                   failures[reason]+=1
@@ -1162,24 +1182,49 @@ jobs:
           print('FORMATVARIANTEN:',[(dict(k),v) for k,v in formats.items()])
           print('FEHLER:',dict(failures))
           if failures or counts['validated'] != len(historical_reports) or len(events)!=len(historical_reports): raise RuntimeError('Importvalidierung unvollstaendig; keine Schreiboperation')
-          if not all(e['is_approved'] for e in events): raise RuntimeError('Nicht alle Berichte genehmigt')
           clubs=[dict(club_id=k,club_name=v) for k,v in sorted(historical_clubs.items())]
           fields=('member_id','club_id','season','competition_type','source_season','portrait_url','team_assignment','report_availability')
           memberships=[dict(**{k:x[k] for k in fields},nuliga_person_id=x['person_id']) for x in all_careers if not x['is_dart_lions']]
           payload=dict(clubs=clubs,memberships=memberships,events=events)
           print('IMPORTVORSCHAU:',dict(clubs=len(clubs),memberships=len(memberships),events=len(events),matches=sum(len(e['matches']) for e in events),players=sum(len(m['players']) for e in events for m in e['matches']),averages=sum(len(e['averages']) for e in events),highlights=sum(len(e['highlights']) for e in events),review_events=sum(bool(e['reviews']) for e in events)))
+          existing = [e for e in events if e['meeting_id'] in known]
+          new = [e for e in events if e['meeting_id'] not in known and e['is_approved']]
+          provisional = [e for e in events if e['meeting_id'] not in known and not e['is_approved']]
+          changed = [e for e in existing if e['source_hash'] != known[e['meeting_id']]['source_hash']]
+          print('SYNC-VORSCHAU:', json.dumps(dict(existing=len(existing), changed=len(changed), new_approved=len(new), new_unapproved=len(provisional), existing_unapproved=sum(not e['is_approved'] for e in existing))))
+          print('Geaenderte Meeting-IDs:', [e['meeting_id'] for e in changed])
           if os.environ.get('WRITE_IMPORT')!='true':
               print('TESTMODUS: keine Datenbankänderungen. GAME ON!')
           else:
-              request=Request(REST+'rpc/pc_career_import_initial',data=json.dumps({'p_payload':payload},ensure_ascii=False).encode(),headers={'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Content-Type':'application/json','Accept':'application/json'},method='POST')
-              try:
-                  with urlopen(request,timeout=120) as response: result=json.loads(response.read())
-              except HTTPError as e:
-                  print('RPC HTTP-Status:',e.code)
-                  # Error details may contain names or raw records. Do not print them in a public log.
-                  raise RuntimeError('Historischer Import fehlgeschlagen; Datenbankstatus pruefen') from None
-              if not isinstance(result,dict) or result.get('status')!='completed' or result.get('statistics_released')!=0: raise RuntimeError('Unerwartete RPC-Antwort; Datenbankstatus pruefen')
-              print('IMPORTERGEBNIS:',json.dumps(result))
+              def rpc(name, body):
+                  request=Request(REST+'rpc/'+name, data=json.dumps(body,ensure_ascii=False).encode(),headers={'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Content-Type':'application/json','Accept':'application/json'},method='POST')
+                  try:
+                      with urlopen(request,timeout=120) as response: result=json.loads(response.read())
+                  except HTTPError as e:
+                      raise RuntimeError('RPC '+name+' HTTP '+str(e.code)) from None
+                  if not isinstance(result,dict): raise RuntimeError('Unerwartete RPC-Antwort')
+                  return result
+              observed=Counter()
+              for event in existing:
+                  result=rpc('pc_career_observe_report',{'p_report':event})
+                  status=result.get('status')
+                  if status not in {'unchanged','review_required','known_decision','hash_payload_conflict','invalid_current_source'}:
+                      raise RuntimeError('Unerwarteter Beobachtungsstatus')
+                  observed[status]+=1
+                  print('BEOBACHTUNG:',event['meeting_id'],status)
+              print('BEOBACHTUNGEN:',json.dumps(dict(observed)))
+              # Existing unchanged reports may accompany metadata inserts; never send changed reports to initial RPC.
+              unchanged=[e for e in existing if e['is_approved'] and e['source_hash']==known[e['meeting_id']]['source_hash']]
+              if new or unchanged:
+                  payload['events']=new+unchanged
+                  result=rpc('pc_career_import_initial',{'p_payload':payload})
+                  if result.get('status')!='completed' or result.get('statistics_released')!=0:
+                      raise RuntimeError('Unerwartete Importantwort')
+                  print('IMPORTERGEBNIS:',json.dumps(result))
+              else:
+                  print('Kein genehmigter neuer oder unveraenderter Bericht fuer Erstimport.')
+              if observed['hash_payload_conflict'] or observed['invalid_current_source']:
+                  raise RuntimeError('Quellkonflikt gespeichert; manuelle Pruefung erforderlich')
               print('GAME ON!')
 
           PY
