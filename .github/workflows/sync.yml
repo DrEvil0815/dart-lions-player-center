@@ -1,10 +1,10 @@
 name: Player Center - Gesamtsynchronisierung
 
 on:
-  workflow_dispatch:
   schedule:
-     - cron: '0 6 * * *'
-       timezone: 'Europe/Berlin'
+    - cron: '0 6 * * *'
+      timezone: Europe/Berlin
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -69,3 +69,12 @@ jobs:
               raise RuntimeError('Gesamtabgleich nicht erfolgreich')
           print(json.dumps(result, ensure_ascii=False, indent=2))
           PY
+
+  historical:
+    needs: reconcile
+    uses: ./.github/workflows/import_nuliga_historical_v1.yml
+    with:
+      write_import: true
+    secrets:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
