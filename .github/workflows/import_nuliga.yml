@@ -1,4 +1,4 @@
-name: Player Center - nuLiga Import
+name: Player Center - nuLiga Import V2
 on:
   workflow_call:
     secrets:
@@ -37,7 +37,7 @@ jobs:
           BASE='https://bdv-dart.liga.nu'
           WA=BASE+'/cgi-bin/WebObjects/nuLigaDARTDE.woa/wa/'
           CLUB='6042'
-          GROUPS={'211419':'I','211414':'II','211415':'III','211398':'Pokal'}
+          GROUPS={}
           def txt(x): return ' '.join(x.stripped_strings)
           def param(url,key): return parse_qs(urlparse(url).query).get(key,[None])[0]
           def pair(s):
@@ -58,6 +58,62 @@ jobs:
                   if not soup.select_one('#content h1'):
                       print('Seitentext:',txt(soup.body or soup)[:700])
                   return soup
+          def discover_groups():
+              url=WA+'clubTeams?club='+CLUB
+              content=fetch(url).select_one('#content')
+              if content is None or 'Mannschaften und Ligeneinteilung' not in txt(content):
+                  raise ValueError('Falsche Vereinsseite')
+              groups={}
+              for row in content.select('table tr'):
+                  cells=row.find_all('td',recursive=False)
+                  if len(cells)<3: continue
+                  link=cells[1].select_one('a[href*="groupPage"]')
+                  if not link: continue
+                  href=urljoin(url,link['href'])
+                  group=param(href,'group'); champ=param(href,'championship')
+                  if urlparse(href).hostname!='bdv-dart.liga.nu' or not group or not group.isdigit() or not champ:
+                      raise ValueError('Gruppenlink ungueltig')
+                  matches=re.findall(r'(?<!\d)(\d{4}|\d{2})/(\d{2})(?!\d)',champ)
+                  if len(matches)!=1: raise ValueError('Spielzeit nicht eindeutig: '+champ)
+                  start,end=map(int,matches[0]); start=start+2000 if start<100 else start
+                  if (start+1)%100!=end: raise ValueError('Spielzeit ungueltig')
+                  season=f'{start}/{end:02d}'
+                  kind='cup' if re.search(r'pokal|cup',champ,re.I) else 'league'
+                  item=groups.setdefault(group,dict(champ=champ,season=season,kind=kind,url=href,teams=set()))
+                  if (item['champ'],item['season'])!=(champ,season): raise ValueError('Gruppen-ID mehrdeutig')
+                  item['teams'].add(txt(cells[0]))
+              if not groups: raise ValueError('Keine Gruppen erkannt')
+              for group,item in groups.items():
+                  page=fetch(item['url']).select_one('#content')
+                  if page is None: raise ValueError('Gruppeninhalt fehlt')
+                  for team in sorted(item['teams']):
+                      ids=set()
+                      for link in page.select('a[href]'):
+                          href=urljoin(item['url'],link['href'])
+                          if txt(link)==team and urlparse(href).hostname=='bdv-dart.liga.nu' and urlparse(href).path.endswith('/teamPortrait') and param(href,'group')==group and param(href,'championship')==item['champ']:
+                              tid=param(href,'teamtable')
+                              if tid and tid.isdigit(): ids.add(tid)
+                      if len(ids)!=1: raise ValueError('Mannschafts-ID nicht eindeutig: '+team)
+                      print('MANNSCHAFT:',team,'|',item['season'],'|',item['kind'],'| Gruppe:',group,'| ID:',next(iter(ids)))
+              print('GRUPPEN:',len(groups),'| Mannschaftsteilnahmen:',sum(len(x['teams']) for x in groups.values()))
+              return groups
+
+          def known_reports():
+              base=os.environ['SUPABASE_URL'].strip().rstrip('/').removesuffix('/rest/v1')+'/rest/v1/'
+              key=os.environ['SUPABASE_SERVICE_ROLE_KEY'].strip()
+              if not key or not base.startswith('https://'): raise RuntimeError('Supabase-Zugangsdaten fehlen')
+              headers={'apikey':key}
+              if not key.startswith('sb_secret_'): headers['Authorization']='Bearer '+key
+              result=[]
+              for offset in range(0,100000,500):
+                  query=urlencode({'select':'nuliga_match_id,nuliga_group_id,season','is_finished':'eq.true','order':'nuliga_match_id.asc','limit':500,'offset':offset})
+                  with urlopen(Request(base+'pc_nuliga_events?'+query,headers=headers),timeout=60) as response:
+                      batch=json.load(response)
+                  if not isinstance(batch,list): raise ValueError('Datenbankantwort ungueltig')
+                  result.extend(batch)
+                  if len(batch)<500: return result
+              raise ValueError('Sicherheitslimit Datenbankabfrage')
+
           def players(cell):
               return [{'name':txt(a),'person':param(a.get('href',''),'person'),'club':param(a.get('href',''),'club')} for a in cell.select('a[href*="playerPortrait"]')]
           def parse(s):
@@ -142,9 +198,9 @@ jobs:
               if ('Average der Spieler' in headings and seen_av != {1,2}) or ('Average der Spieler' not in headings and seen_av):
                   raise ValueError('Average-Abschnitt unvollstaendig')
               if len({m['label'] for m in matches}) != len(matches): raise ValueError('Matchbezeichnungen doppelt')
-              expect=Counter({'singles':8,'doubles':2}) if group=='211398' else Counter({'singles':16,'doubles':2})
+              expect=Counter({'singles':8,'doubles':2}) if GROUPS[group]['kind']=='cup' else Counter({'singles':16,'doubles':2})
               actual=Counter(m['type'] for m in matches)
-              if group=='211398' and actual.get('team')==1: expect['team']=1
+              if GROUPS[group]['kind']=='cup' and actual.get('team')==1: expect['team']=1
               if actual!=expect: raise ValueError('Spielberichtformat unvollstaendig')
               for m in matches:
                   a,b=m['legs']; x,y=m['result']
@@ -169,7 +225,7 @@ jobs:
 
           def payload(d,href):
               mid=d['meeting']; side=d['side']; home=d['home']; away=d['away']
-              event=dict(nuliga_match_id=mid,nuliga_group_id=d['group'],season='2026/27',competition_name=d['competition'],competition_type='cup' if d['group']=='211398' else 'league',event_date=datetime.strptime(d['date'],'%d.%m.%Y').date().isoformat(),event_time=d['event_time'],home_team=home,away_team=away,lions_team=home if side==1 else away,is_home_match=side==1,home_score=d['result'][0],away_score=d['result'][1],home_legs=d['legs'][0],away_legs=d['legs'][1],is_finished=True,is_approved=d['approved'],report_url=href,report_status='approved' if d['approved'] else 'provisional',raw_data=d)
+              event=dict(nuliga_match_id=mid,nuliga_group_id=d['group'],season=GROUPS[d['group']]['season'],competition_name=d['competition'],competition_type='cup' if GROUPS[d['group']]['kind']=='cup' else 'league',event_date=datetime.strptime(d['date'],'%d.%m.%Y').date().isoformat(),event_time=d['event_time'],home_team=home,away_team=away,lions_team=home if side==1 else away,is_home_match=side==1,home_score=d['result'][0],away_score=d['result'][1],home_legs=d['legs'][0],away_legs=d['legs'][1],is_finished=True,is_approved=d['approved'],report_url=href,report_status='approved' if d['approved'] else 'provisional',raw_data=d)
               ms=[]
               for n,m in enumerate(d['matches'],1):
                   a,b=m['legs']; x,y=m['result']; ps=[]
@@ -235,9 +291,11 @@ jobs:
                   for path in sys.argv[1:]: show(parse(BeautifulSoup(open(path,encoding='utf-8').read(),'html.parser')))
               else:
                   failures=0; tested=set(); aggregate=Counter(); found=set(); reports=[]
-                  for group,team in GROUPS.items():
-                      champ='Oberfranken+Pokal+26%2F27' if group=='211398' else 'OFr+2026%2F27'
-                      url=WA+'groupPage?championship='+champ+'&group='+group+'&displayDetail=meetings&displayTyp=gesamt'
+                  GROUPS.update(discover_groups())
+                  known=known_reports()
+                  for group,item in GROUPS.items():
+                      team=', '.join(sorted(item['teams']))
+                      url=WA+'groupPage?'+urlencode({'championship':item['champ'],'group':group,'displayDetail':'meetings','displayTyp':'gesamt'})
                       print('\n--- Spielplan:',team,group,'---')
                       try:
                           links=discover(fetch(url),url)
@@ -272,12 +330,16 @@ jobs:
                               print('Summenpruefung: OK')
                           except Exception as e:
                               failures+=1; print('BERICHT-FEHLER:',mid,type(e).__name__,str(e)); traceback.print_exc()
-                  missing={'6106644','6106663','6114326'}-found
+                  expected={str(r['nuliga_match_id']) for r in known if str(r['nuliga_group_id']) in GROUPS}
+                  outside={str(r['nuliga_match_id']) for r in known if str(r['nuliga_group_id']) not in GROUPS}
+                  print('Bekannte Berichte ausserhalb aktueller Gruppen (nicht erneut geprueft):',len(outside))
+                  missing=expected-found
                   failures+=len(missing)
                   print('Fehlende Referenzberichte:',sorted(missing))
                   print('GESAMT:',json.dumps(dict(aggregate),ensure_ascii=False))
                   print('Gefundene Berichte:',len(found),'| Fehler:',failures)
                   if failures: sys.exit(1)
+                  for d,href in reports: payload(d,href)
                   if os.environ.get('WRITE_DB')=='true': save_reports(reports)
-                  else: print('Nur Lesemodus - keine Datenbankzugriffe')
+                  else: print('TESTMODUS: Payloads validiert, keine Datenbankänderungen')
           PYCODE
