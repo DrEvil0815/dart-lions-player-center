@@ -78,3 +78,10 @@ jobs:
     secrets:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+  portraits:
+    # Eigenstaendig, ohne needs: kann Statistikimporte weder blockieren noch veraendern.
+    uses: ./.github/workflows/import_portraits.yml
+    secrets:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
